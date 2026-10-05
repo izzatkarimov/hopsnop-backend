@@ -10,11 +10,14 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if TYPE_CHECKING:
+    from app.models.email_verification_token import EmailVerificationToken
     from app.models.follow import Follow
     from app.models.like import Like
+    from app.models.password_reset_token import PasswordResetToken
     from app.models.post import Post
     from app.models.repost import Repost
     from app.models.story import Story
+    from app.models.user_session import UserSession
 
 
 class User(Base):
@@ -36,6 +39,9 @@ class User(Base):
     avatar_url: Mapped[str | None] = mapped_column(String)
     is_private: Mapped[bool] = mapped_column(server_default=false())
     is_active: Mapped[bool] = mapped_column(server_default=true())
+    # NULL until the address has been confirmed through an emailed token; then
+    # the moment it was confirmed.
+    email_verified_at: Mapped[datetime | None] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(),
@@ -79,6 +85,24 @@ class User(Base):
     followers: Mapped[list[Follow]] = relationship(
         foreign_keys="Follow.following_id",
         back_populates="following",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    # Authentication state. It belongs to the account and is removed with it
+    # (ON DELETE CASCADE in the database).
+    sessions: Mapped[list[UserSession]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    email_verification_tokens: Mapped[list[EmailVerificationToken]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    password_reset_tokens: Mapped[list[PasswordResetToken]] = relationship(
+        back_populates="user",
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
