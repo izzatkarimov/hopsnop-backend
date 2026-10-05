@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.auth import router as auth_router
 from app.api.deps import verify_request_origin
+from app.api.users import router as users_router
 from app.core.config import settings
 from app.services.auth import AuthError
 
@@ -28,6 +29,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
+app.include_router(users_router)
 
 
 # Every error has the same shape: {"detail": ...}.

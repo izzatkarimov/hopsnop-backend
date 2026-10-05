@@ -169,6 +169,60 @@ curl -X POST localhost:8000/auth/verify-email \
      -H 'Content-Type: application/json' -d '{"token": "<token>"}'
 ```
 
+## User profiles
+
+| Endpoint | Access | Purpose |
+| --- | --- | --- |
+| `GET /users/me` | authenticated | The caller's own profile, with private account fields |
+| `PATCH /users/me` | authenticated | Change the caller's own profile |
+| `GET /users/{username}` | public | Anyone's public profile |
+
+A profile is the existing `users` row; there is no separate profile table.
+`followers_count` and `following_count` are counted from `follows` on every
+request and are not stored anywhere.
+
+### Public and private views
+
+The two views are separate schemas in `app/schemas/user.py`, each listing its
+fields in full.
+
+- **Public** (`GET /users/{username}`): `id`, `username`, `display_name`, `bio`,
+  `avatar_url`, `is_private`, `followers_count`, `following_count`,
+  `created_at`. The query selects only these columns, so the private ones are
+  never read on this path.
+- **Own** (`GET /users/me`): the same, plus `email` and `email_verified_at`.
+
+`password_hash`, `is_active` and `updated_at` are in neither.
+
+The username in the path is matched in its canonical lowercase form. Every
+account that is not shown gives the same `404`: one that does not exist, one
+that is deactivated, and one whose email address was never verified. A private
+account's profile is still shown; `is_private` only marks its future content as
+restricted.
+
+### Editing
+
+`PATCH /users/me` changes only the fields that are sent:
+
+| Field | Rule | `null` |
+| --- | --- | --- |
+| `display_name` | 1 to 50 characters after trimming, any script | rejected |
+| `bio` | up to 160 characters of plain text after trimming | clears it |
+| `avatar_url` | an absolute `http(s)` URL | clears it |
+| `is_private` | `true` or `false` | rejected |
+
+A blank `bio` is stored as no bio. A request with none of these fields is
+rejected with `422`. Any other field in the body is ignored, so `username`,
+`email`, `is_active` and the rest cannot be changed here; the service also
+refuses to write any column outside these four.
+
+The endpoint takes no user identifier. It always edits the authenticated user,
+so there is no way to address someone else's profile.
+
+`avatar_url` is checked for its form only. The server never requests it.
+Profile text is stored and returned exactly as written, as JSON; escaping it
+for display is the client's job.
+
 ## Tests
 
 ```bash

@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from typing import Annotated
 from urllib.parse import urlsplit
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -22,6 +22,14 @@ def get_db() -> Iterator[Session]:
 
 
 DbSession = Annotated[Session, Depends(get_db)]
+
+
+def no_store(response: Response) -> None:
+    """For responses that carry private account data.
+
+    Neither a browser nor an intermediary should keep a copy of them.
+    """
+    response.headers["Cache-Control"] = "no-store"
 
 
 def verify_request_origin(request: Request) -> None:

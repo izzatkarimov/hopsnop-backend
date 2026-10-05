@@ -186,7 +186,13 @@ def test_no_get_route_changes_state() -> None:
         if "get" in operations
     )
 
-    assert get_routes == ["/auth/me", "/auth/sessions", "/health"]
+    assert get_routes == [
+        "/auth/me",
+        "/auth/sessions",
+        "/health",
+        "/users/me",
+        "/users/{username}",
+    ]
 
 
 def test_json_body_must_be_declared_as_json(

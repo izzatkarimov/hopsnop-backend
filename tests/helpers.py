@@ -1,16 +1,20 @@
-"""Small helpers shared by the authentication tests."""
+"""Small helpers shared by the API tests."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.cookies import Morsel, SimpleCookie
 from urllib.parse import parse_qs, urlsplit
 
 from fastapi.testclient import TestClient
 from httpx import Response
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.security import hash_password
-from app.models import User
+from app.db.session import engine
+from app.models import Follow, User
 
 PASSWORD = "correct horse battery staple"
 # Hashed once: Argon2 is slow by design, and most tests only need an account
@@ -40,6 +44,12 @@ def add_user(
     session.add(user)
     session.flush()
     return user
+
+
+def follow(session: Session, follower: User, following: User) -> None:
+    """Make one user follow another, directly in the database."""
+    session.add(Follow(follower_id=follower.id, following_id=following.id))
+    session.flush()
 
 
 def registration(**overrides: object) -> dict:
@@ -110,3 +120,25 @@ def keys_in(payload: object) -> set[str]:
     if isinstance(payload, list):
         return set().union(*(keys_in(item) for item in payload))
     return set()
+
+
+def columns(session: Session, user: User) -> dict[str, object]:
+    """Every column of a user's row, as currently stored."""
+    session.refresh(user)
+    return {column.key: getattr(user, column.key) for column in User.__table__.columns}
+
+
+@contextmanager
+def recorded_selects() -> Iterator[list[str]]:
+    """Collects the SELECT statements sent to the database inside the block."""
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
