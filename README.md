@@ -234,6 +234,10 @@ for display is the client's job.
 | `GET /posts/{post_id}` | public | A single post |
 | `PATCH /posts/{post_id}` | author | Change the text, for 60 minutes |
 | `DELETE /posts/{post_id}` | author | Delete the post (soft deletion) |
+| `POST /posts/{post_id}/like` | authenticated | Like the post |
+| `DELETE /posts/{post_id}/like` | authenticated | Take the like back |
+| `POST /posts/{post_id}/repost` | authenticated | Repost the post |
+| `DELETE /posts/{post_id}/repost` | authenticated | Take the repost back |
 | `GET /users/{username}/posts` | public | A user's posts, newest first |
 
 "Public" means no session is needed for a public account's posts. The answer
@@ -252,7 +256,11 @@ in turn. Everything below applies to replies exactly as it does to posts.
   "parent_post_id": null,
   "is_reply": false,
   "created_at": "2026-10-05T12:00:00Z",
-  "updated_at": "2026-10-05T12:00:00Z"
+  "updated_at": "2026-10-05T12:00:00Z",
+  "like_count": 12,
+  "liked_by_me": true,
+  "repost_count": 4,
+  "reposted_by_me": false
 }
 ```
 
@@ -321,6 +329,53 @@ its author included: it cannot be read, edited, replied to, or deleted again
 `parent_post_id` must name a post the author can currently see. A parent that
 does not exist, was deleted, or is hidden gives the same `404 Parent post not
 found`. The parent of a post cannot be changed afterwards.
+
+### Likes and reposts
+
+`POST` makes the caller's like or repost of a post, `DELETE` takes it back.
+All four need a session of an active account with a verified email address
+(`401` without a session, `403` for an unverified address), and each answers
+`200` with where the post now stands with the caller:
+
+```json
+{"liked": true, "like_count": 12}
+{"reposted": false, "repost_count": 4}
+```
+
+A request can be repeated. Liking a post that is already liked leaves it liked,
+and taking back a like that is not there leaves it not there; both are answered
+with the current state, never with `409`. The same goes for reposts, and a like
+and a repost of the same post are independent of each other.
+
+Only a post the caller can read can be liked or reposted, replies included,
+and a private account's own posts by that account. Any other post, whether
+hidden, deleted or nonexistent, is `404 Post not found`, from the same lookup
+as reading it, so an attempt reveals nothing about a hidden post. That also
+holds for taking back: the likes and reposts of a post that is deleted or
+becomes hidden stay in the database with it, are reported to nobody, and are
+shown again if the post becomes readable again.
+
+Every post in every response carries `like_count`, `liked_by_me`,
+`repost_count` and `reposted_by_me`. The counts are the same for every reader.
+The other two are the reader's own and are `false` for an anonymous request.
+Who else liked or reposted a post is not exposed anywhere: there is no endpoint
+that lists it, and only numbers leave the `likes` and `reposts` tables.
+
+The counts are not stored. They are counted from the rows by the statement that
+loads the posts (through `ix_likes_post_id` and `ix_reposts_post_id`), and the
+reader's own are looked up by primary key in that same statement, so a page
+costs one statement however many posts, likes and reposts are on it. No counter
+can drift from the rows; the price is that a count costs as much as the post
+has likes.
+
+A second like by the same user is ruled out by the primary key
+`(user_id, post_id)`. Requests insert with `ON CONFLICT DO NOTHING` instead of
+checking first, so two identical requests arriving at once cannot both insert
+and neither fails.
+
+Likes and reposts change nothing about which posts a list contains or in which
+order. A repost is, for now, a mark on the post and a number; it does not put
+the post anywhere.
 
 ### Pagination
 

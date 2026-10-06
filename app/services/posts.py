@@ -1,25 +1,39 @@
-"""Posts: writing, reading, editing and deleting them, and the feed of them.
+"""Posts: writing, reading, editing, deleting, liking and reposting them, and
+the feed of them.
 
 A reply is a post like any other. It only has ``parent_post_id`` set, and it
 follows every rule here in its own right: its own author, its own visibility,
-its own edit window.
+its own edit window, its own likes and reposts.
 
 Nothing in here trusts the client for anything but the text of a post and the
-id of the post being replied to. The author is always the authenticated user
-passed in, and every timestamp comes from this module's clock.
+id of the post being replied to, liked or reposted. The author, and whoever
+likes or reposts, is always the authenticated user passed in, and every
+timestamp comes from this module's clock or from the database.
 
 Like the authentication service, every public function that writes is one
 unit of work and commits once, at the end.
 """
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import ColumnElement, Select, or_, select
-from sqlalchemy.orm import Session, contains_eager
+from sqlalchemy import (
+    ColumnElement,
+    ScalarSelect,
+    Select,
+    delete,
+    exists,
+    false,
+    func,
+    or_,
+    select,
+)
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session, contains_eager, with_expression
 
 from app.core.pagination import Cursor, Page, paginate
-from app.models import Post, User
+from app.models import Like, Post, Repost, User
 
 EDIT_WINDOW_MINUTES = 60
 # How long after it was created a post can still be edited. The deadline is
@@ -103,13 +117,56 @@ def _posts_readable_by(viewer: User | None) -> ColumnElement[bool]:
     return or_(_ACCOUNT_IS_PUBLIC, User.id == viewer.id)
 
 
+# A like and a repost are the same thing to the database: a row that says
+# "this user, this post". What is written for one below is written for both.
+_Interaction = type[Like] | type[Repost]
+
+
+def _count_of(
+    kind: _Interaction, post_id: ColumnElement[uuid.UUID] | uuid.UUID
+) -> ScalarSelect[int]:
+    """Subquery counting the likes, or the reposts, of a post.
+
+    Counted from the rows every time, through the index on ``post_id``. No
+    counter is stored anywhere, so none can drift from the rows.
+    """
+    return (
+        select(func.count())
+        .select_from(kind)
+        .where(kind.post_id == post_id)
+        .scalar_subquery()
+    )
+
+
+def _made_by(
+    kind: _Interaction,
+    post_id: ColumnElement[uuid.UUID] | uuid.UUID,
+    viewer: User | None,
+) -> ColumnElement[bool]:
+    """Condition: has ``viewer`` liked, or reposted, the post?
+
+    Never true for a request that is not authenticated. For one that is, it
+    is a lookup by primary key.
+    """
+    if viewer is None:
+        return false()
+    return exists().where(kind.user_id == viewer.id, kind.post_id == post_id)
+
+
 def _visible_posts(viewer: User | None) -> Select[tuple[Post]]:
-    """Every post ``viewer`` may see, each with its author.
+    """Every post ``viewer`` may see, each with its author, likes and reposts.
 
     It is the author's account that decides, also for a reply: replying to a
     public post does not make a private account's reply public.
 
-    Of the author, only what a post shows is read from the database.
+    Of the author, only what a post shows is read from the database. Of the
+    likes and reposts, only how many there are and whether ``viewer`` is
+    among them: the same statement computes both for every post it returns,
+    so a list costs no query per post.
+
+    Those four values exist on a post only as it comes out of this query.
+    They are gone once the session commits, so a function that commits and
+    then returns a post reads it again (``get_post``).
     """
     return (
         select(Post)
@@ -119,7 +176,11 @@ def _visible_posts(viewer: User | None) -> Select[tuple[Post]]:
                 User.username,
                 User.display_name,
                 User.avatar_url,
-            )
+            ),
+            with_expression(Post.like_count, _count_of(Like, Post.id)),
+            with_expression(Post.liked_by_me, _made_by(Like, Post.id, viewer)),
+            with_expression(Post.repost_count, _count_of(Repost, Post.id)),
+            with_expression(Post.reposted_by_me, _made_by(Repost, Post.id, viewer)),
         )
         .where(
             Post.deleted_at.is_(None),
@@ -236,8 +297,11 @@ def create_post(
         updated_at=now,
     )
     db.add(post)
+    # Assigns the id, which is needed to read the post back.
+    db.flush()
+    post_id = post.id
     db.commit()
-    return post
+    return get_post(db, post_id, author)
 
 
 def update_post(db: Session, user: User, post_id: uuid.UUID, *, content: str) -> Post:
@@ -253,7 +317,7 @@ def update_post(db: Session, user: User, post_id: uuid.UUID, *, content: str) ->
         post.content = content
         post.updated_at = now
     db.commit()
-    return post
+    return get_post(db, post_id, user)
 
 
 def delete_post(db: Session, user: User, post_id: uuid.UUID) -> None:
@@ -289,3 +353,73 @@ def _own_post_for_change(db: Session, user: User, post_id: uuid.UUID) -> Post:
     if post.author_id != user.id:
         raise NotPostAuthorError
     return post
+
+
+# --- likes and reposts ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InteractionState:
+    """Where a post stands with one user's like, or repost, after a change."""
+
+    # Whether the user's like, or repost, of the post now exists.
+    active: bool
+    # How many the post now has, the user's own included.
+    count: int
+
+
+def set_like(
+    db: Session, user: User, post_id: uuid.UUID, *, liked: bool
+) -> InteractionState:
+    """Make ``user`` like the post, or no longer like it."""
+    return _set_interaction(db, Like, user, post_id, wanted=liked)
+
+
+def set_repost(
+    db: Session, user: User, post_id: uuid.UUID, *, reposted: bool
+) -> InteractionState:
+    """Make ``user`` repost the post, or no longer repost it."""
+    return _set_interaction(db, Repost, user, post_id, wanted=reposted)
+
+
+def _set_interaction(
+    db: Session,
+    kind: _Interaction,
+    user: User,
+    post_id: uuid.UUID,
+    *,
+    wanted: bool,
+) -> InteractionState:
+    """Bring ``user``'s like, or repost, of the post to the state asked for.
+
+    The result is the same whatever the state was before: liking a post that
+    is already liked leaves it liked, and taking back a like that is not
+    there leaves it not there. Neither is an error.
+
+    Only a post the user can see can be liked or reposted, and only from
+    such a post can either be taken back. Any other post is not found, with
+    the answer and the lookup that reading it gives.
+    """
+    get_post(db, post_id, user)
+
+    if wanted:
+        # The primary key (user, post) is what rules out a second row. The
+        # conflict is left to the database rather than looked for first and
+        # avoided, so two requests arriving at once cannot both insert.
+        db.execute(
+            insert(kind)
+            .values(user_id=user.id, post_id=post_id)
+            .on_conflict_do_nothing()
+        )
+    else:
+        db.execute(
+            delete(kind).where(kind.user_id == user.id, kind.post_id == post_id)
+        )
+
+    # Read from the rows, after the change and inside its transaction: what
+    # is returned is what the database holds, not what this request assumed.
+    active, count = db.execute(
+        select(_made_by(kind, post_id, user), _count_of(kind, post_id))
+    ).one()
+    db.commit()
+    return InteractionState(active=active, count=count)

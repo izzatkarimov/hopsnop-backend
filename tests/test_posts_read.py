@@ -31,6 +31,10 @@ POST_FIELDS = {
     "created_at",
     "updated_at",
     "is_reply",
+    "like_count",
+    "liked_by_me",
+    "repost_count",
+    "reposted_by_me",
 }
 AUTHOR_FIELDS = {"id", "username", "display_name", "avatar_url"}
 NOT_FOUND = {"detail": "Post not found."}
@@ -79,6 +83,10 @@ def test_public_post_can_be_read_without_authentication(
         "content": "Hello Hopsnop!",
         "parent_post_id": None,
         "is_reply": False,
+        "like_count": 0,
+        "liked_by_me": False,
+        "repost_count": 0,
+        "reposted_by_me": False,
     }
 
 

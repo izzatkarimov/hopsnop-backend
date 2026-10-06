@@ -73,6 +73,10 @@ def test_the_only_post_routes_are_the_intended_ones() -> None:
         ("GET", "/posts/{post_id}"),
         ("PATCH", "/posts/{post_id}"),
         ("DELETE", "/posts/{post_id}"),
+        ("POST", "/posts/{post_id}/like"),
+        ("DELETE", "/posts/{post_id}/like"),
+        ("POST", "/posts/{post_id}/repost"),
+        ("DELETE", "/posts/{post_id}/repost"),
         ("GET", "/users/{username}/posts"),
     }
 
@@ -80,7 +84,7 @@ def test_the_only_post_routes_are_the_intended_ones() -> None:
 def test_nothing_from_later_phases_is_exposed() -> None:
     paths = " ".join(app.openapi()["paths"])
 
-    later_phases = ("like", "repost", "follow", "stor", "upload", "media")
+    later_phases = ("follow", "stor", "upload", "media")
     for later in (*later_phases, "search", "notif", "mention", "hashtag"):
         assert later not in paths
 
@@ -102,6 +106,10 @@ def test_response_schemas_hold_no_account_data() -> None:
         "created_at",
         "updated_at",
         "is_reply",
+        "like_count",
+        "liked_by_me",
+        "repost_count",
+        "reposted_by_me",
     }
     assert author == {"id", "username", "display_name", "avatar_url"}
     assert (post | author).isdisjoint(SENSITIVE_KEYS | NEVER_IN_A_POST)

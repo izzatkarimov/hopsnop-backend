@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import CheckConstraint, ForeignKey, Index, Text, func
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, query_expression, relationship
 
 from app.db.base import Base
 
@@ -65,6 +65,16 @@ class Post(Base):
     # NULL while the post exists for its readers; then the moment it was
     # deleted.
     deleted_at: Mapped[datetime | None] = mapped_column()
+
+    # How many likes and reposts the post has, and whether the reader of the
+    # post is among them. These are not columns and nothing is stored: the
+    # query that loads a post for a reader computes them from the likes and
+    # reposts tables (``app.services.posts._visible_posts``). On a post that
+    # was loaded in any other way they are None.
+    like_count: Mapped[int] = query_expression()
+    liked_by_me: Mapped[bool] = query_expression()
+    repost_count: Mapped[int] = query_expression()
+    reposted_by_me: Mapped[bool] = query_expression()
 
     author: Mapped[User] = relationship(back_populates="posts")
 

@@ -39,6 +39,10 @@ POST_FIELDS = {
     "created_at",
     "updated_at",
     "is_reply",
+    "like_count",
+    "liked_by_me",
+    "repost_count",
+    "reposted_by_me",
 }
 USER_NOT_FOUND = {"detail": "User not found."}
 PRIVATE = {"detail": "This account's posts are private."}

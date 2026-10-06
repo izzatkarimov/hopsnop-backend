@@ -96,11 +96,32 @@ class PostResponse(BaseModel):
     created_at: datetime
     # Equal to created_at for a post that was never edited.
     updated_at: datetime
+    # Counted from the likes and reposts at the moment of the request. Who
+    # liked or reposted is not part of a post: of all those users, the caller
+    # only learns about themselves, and an anonymous caller about nobody.
+    like_count: int
+    liked_by_me: bool
+    repost_count: int
+    reposted_by_me: bool
 
     @computed_field
     @property
     def is_reply(self) -> bool:
         return self.parent_post_id is not None
+
+
+class LikeResponse(BaseModel):
+    """Where a post stands with the caller's like after a request."""
+
+    liked: bool
+    like_count: int
+
+
+class RepostResponse(BaseModel):
+    """Where a post stands with the caller's repost after a request."""
+
+    reposted: bool
+    repost_count: int
 
 
 class PostPageResponse(BaseModel):

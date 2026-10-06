@@ -38,6 +38,10 @@ POST_FIELDS = {
     "created_at",
     "updated_at",
     "is_reply",
+    "like_count",
+    "liked_by_me",
+    "repost_count",
+    "reposted_by_me",
 }
 AUTHOR_FIELDS = {"id", "username", "display_name", "avatar_url"}
 EMPTY = {"items": [], "next_cursor": None}
@@ -285,6 +289,10 @@ def test_items_are_posts_in_their_usual_shape(
         "content": "Hello Hopsnop!",
         "parent_post_id": None,
         "is_reply": False,
+        "like_count": 0,
+        "liked_by_me": False,
+        "repost_count": 0,
+        "reposted_by_me": False,
     }
 
 
@@ -1333,8 +1341,14 @@ def test_feed_is_filtered_ordered_and_cut_by_the_database(
         assert condition in sql, condition
     assert " ORDER BY posts.created_at DESC, posts.id DESC LIMIT " in sql
     assert "OFFSET" not in sql
-    # Nothing but posts and their authors is consulted.
-    assert re.findall(r"(?:FROM|JOIN) (\w+)", sql) == ["posts", "users"]
+    # Nothing but posts, their authors and their likes and reposts is
+    # consulted, and the last two only to count them.
+    assert set(re.findall(r"(?:FROM|JOIN) (\w+)", sql)) == {
+        "posts",
+        "users",
+        "likes",
+        "reposts",
+    }
 
 
 def test_feed_does_not_read_the_authors_private_columns(
