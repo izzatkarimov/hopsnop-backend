@@ -10,8 +10,8 @@ from app.api.deps import DbSession, OptionalUser, Pagination, no_store
 from app.schemas.post import PostPageResponse, PostResponse
 from app.services import posts as posts_service
 
-# A post in the feed can be deleted, and its author's account can become
-# private, at any moment. No copy of an answer should outlive that.
+# A post in the feed can be deleted, and its author's account can be
+# deactivated, at any moment. No copy of an answer should outlive that.
 router = APIRouter(prefix="/feed", tags=["feed"], dependencies=[Depends(no_store)])
 
 
@@ -21,10 +21,10 @@ def get_for_you_feed(
     page: Pagination,
     db: DbSession,
 ) -> PostPageResponse:
-    """For You: the posts of public accounts, newest first, replies included.
+    """For You: every post that is shown, newest first, replies included.
 
-    No authentication is needed, and the answer is the same with or without
-    it. The posts of a private account are not in this feed for anyone.
+    No authentication is needed, and the same posts are in it with or without
+    it. Whom the caller follows plays no part.
     """
     posts = posts_service.list_for_you_feed(
         db,

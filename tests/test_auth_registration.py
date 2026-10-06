@@ -35,7 +35,6 @@ def test_valid_registration_succeeds(client: TestClient, session: Session) -> No
     assert body["email"] == "alice@example.com"
     assert body["display_name"] == "Alice"
     assert body["is_active"] is True
-    assert body["is_private"] is False
 
     user = session.scalars(select(User)).one()
     assert str(user.id) == body["id"]

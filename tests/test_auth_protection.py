@@ -194,6 +194,9 @@ def test_no_get_route_changes_state() -> None:
         "/posts/{post_id}",
         "/users/me",
         "/users/{username}",
+        "/users/{username}/follow-status",
+        "/users/{username}/followers",
+        "/users/{username}/following",
         "/users/{username}/posts",
     ]
 

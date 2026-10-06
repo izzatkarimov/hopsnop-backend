@@ -1,4 +1,4 @@
-"""Reading a single post: who may see it, and what the answer contains."""
+"""Reading a single post: when it is shown, and what the answer contains."""
 
 import re
 import uuid
@@ -52,15 +52,10 @@ ACCOUNT_FIELDS = {
 }
 
 
-def make_private(session: Session, user: User) -> None:
-    user.is_private = True
-    session.flush()
+# --- reading a post ------------------------------------------------------
 
 
-# --- public posts --------------------------------------------------------
-
-
-def test_public_post_can_be_read_without_authentication(
+def test_post_can_be_read_without_authentication(
     client: TestClient, session: Session, alice_account: User
 ) -> None:
     alice_account.avatar_url = "https://cdn.example.com/avatars/alice.png"
@@ -90,7 +85,7 @@ def test_public_post_can_be_read_without_authentication(
     }
 
 
-def test_public_post_can_be_read_by_another_user(
+def test_post_can_be_read_by_another_user(
     bob_client: TestClient, session: Session, alice_account: User
 ) -> None:
     post = add_post(session, alice_account)
@@ -101,7 +96,7 @@ def test_public_post_can_be_read_by_another_user(
     assert response.json()["author"]["username"] == "alice"
 
 
-def test_public_post_is_the_same_for_every_viewer(
+def test_post_is_the_same_for_every_viewer(
     make_client, session: Session, alice_account: User, bob_account: User
 ) -> None:
     post = add_post(session, alice_account)
@@ -148,89 +143,53 @@ def test_post_responses_are_not_to_be_cached(
     assert client.get(f"/posts/{post.id}").headers["cache-control"] == "no-store"
 
 
-# --- private accounts ----------------------------------------------------
+# --- no account keeps its posts to itself --------------------------------
 
 
-def test_private_accounts_post_is_not_found_without_authentication(
-    client: TestClient, session: Session, alice_account: User
-) -> None:
-    make_private(session, alice_account)
-    post = add_post(session, alice_account, "For my eyes only")
-
-    response = client.get(f"/posts/{post.id}")
-
-    assert response.status_code == 404
-    assert response.json() == NOT_FOUND
-    assert "For my eyes only" not in response.text
-
-
-def test_private_accounts_post_is_not_found_for_another_user(
-    bob_client: TestClient, session: Session, alice_account: User
-) -> None:
-    make_private(session, alice_account)
-    post = add_post(session, alice_account, "For my eyes only")
-
-    response = bob_client.get(f"/posts/{post.id}")
-
-    assert response.status_code == 404
-    assert response.json() == NOT_FOUND
-    assert "For my eyes only" not in response.text
-
-
-def test_owner_can_read_their_own_private_post(
-    alice_client: TestClient, session: Session, alice_account: User
-) -> None:
-    make_private(session, alice_account)
-    post = add_post(session, alice_account, "For my eyes only")
-
-    response = alice_client.get(f"/posts/{post.id}")
-
-    assert response.status_code == 200
-    assert response.json()["content"] == "For my eyes only"
-
-
-def test_following_a_private_account_does_not_reveal_its_posts_yet(
-    bob_client: TestClient, session: Session, alice_account: User, bob_account: User
-) -> None:
-    # Follow approval does not exist yet, so a row in follows grants nothing.
-    make_private(session, alice_account)
-    post = add_post(session, alice_account)
-    follow(session, bob_account, alice_account)
-
-    assert bob_client.get(f"/posts/{post.id}").status_code == 404
-
-
-def test_visibility_follows_the_accounts_current_privacy_setting(
-    alice_client: TestClient, make_client, session: Session, alice_account: User
-) -> None:
-    post = add_post(session, alice_account)
-    anonymous = make_client()
-    assert anonymous.get(f"/posts/{post.id}").status_code == 200
-
-    alice_client.patch("/users/me", json={"is_private": True})
-    assert anonymous.get(f"/posts/{post.id}").status_code == 404
-    assert alice_client.get(f"/posts/{post.id}").status_code == 200
-
-    alice_client.patch("/users/me", json={"is_private": False})
-    assert anonymous.get(f"/posts/{post.id}").status_code == 200
-
-
-def test_private_post_is_only_readable_through_the_owners_session(
+def test_posts_are_readable_across_accounts_in_both_directions(
     make_client, session: Session, alice_account: User, bob_account: User
 ) -> None:
-    make_private(session, alice_account)
-    make_private(session, bob_account)
     alices = add_post(session, alice_account)
     bobs = add_post(session, bob_account)
     alice, bob = make_client(), make_client()
     log_in(alice, "alice")
     log_in(bob, "bob")
 
-    # Being private oneself gives no access to other private accounts.
-    assert alice.get(f"/posts/{alices.id}").status_code == 200
-    assert alice.get(f"/posts/{bobs.id}").status_code == 404
-    assert bob.get(f"/posts/{bobs.id}").status_code == 200
-    assert bob.get(f"/posts/{alices.id}").status_code == 404
+    for viewer in (make_client(), alice, bob):
+        for post in (alices, bobs):
+            response = viewer.get(f"/posts/{post.id}")
+            assert response.status_code == 200
+            assert "private" not in response.text
+
+
+def test_following_plays_no_part_in_reading_a_post(
+    bob_client: TestClient, session: Session, alice_account: User, bob_account: User
+) -> None:
+    post = add_post(session, alice_account)
+    before = bob_client.get(f"/posts/{post.id}")
+
+    follow(session, bob_account, alice_account)
+
+    # Readable without the follow, and no different with it.
+    assert before.status_code == 200
+    assert bob_client.get(f"/posts/{post.id}").json() == before.json()
+
+
+def test_no_profile_change_hides_a_post(
+    alice_client: TestClient, make_client, session: Session, alice_account: User
+) -> None:
+    post = add_post(session, alice_account)
+    anonymous = make_client()
+    before = anonymous.get(f"/posts/{post.id}").json()
+
+    # There is no privacy setting to switch on, alone or next to a real change.
+    alone = alice_client.patch("/users/me", json={"is_private": True})
+    beside = alice_client.patch("/users/me", json={"is_private": True, "bio": "Hi"})
+
+    after = anonymous.get(f"/posts/{post.id}")
+    assert after.status_code == 200
+    assert after.json() == before
+    assert (alone.status_code, beside.status_code) == (422, 200)
 
 
 # --- posts that are not found --------------------------------------------
@@ -306,15 +265,12 @@ def test_every_post_that_is_not_shown_looks_like_one_that_does_not_exist(
     bob_client: TestClient, session: Session, alice_account: User
 ) -> None:
     deleted = add_post(session, alice_account, deleted=True)
-    private = add_post(session, add_user(session, "private_user"))
-    private.author.is_private = True
     inactive = add_post(session, add_user(session, "inactive", active=False))
     unverified = add_post(session, add_user(session, "unverified", verified=False))
-    session.flush()
 
     responses = [
         bob_client.get(f"/posts/{id}")
-        for id in (uuid.uuid4(), deleted.id, private.id, inactive.id, unverified.id)
+        for id in (uuid.uuid4(), deleted.id, inactive.id, unverified.id)
     ]
 
     # Nothing about the answer says that there is a post behind the id.
@@ -326,74 +282,87 @@ def test_every_post_that_is_not_shown_looks_like_one_that_does_not_exist(
 def test_hidden_post_takes_the_same_queries_as_a_nonexistent_one(
     client: TestClient, session: Session, alice_account: User
 ) -> None:
-    make_private(session, alice_account)
-    hidden = add_post(session, alice_account)
+    hidden = add_post(session, add_user(session, "inactive", active=False))
+    unverified = add_post(session, add_user(session, "unverified", verified=False))
     deleted = add_post(session, alice_account, deleted=True)
 
     statements = []
-    for id in (uuid.uuid4(), hidden.id, deleted.id):
+    for id in (uuid.uuid4(), hidden.id, unverified.id, deleted.id):
         with recorded_selects() as recorded:
             assert client.get(f"/posts/{id}").status_code == 404
         statements.append(recorded)
 
     # One identical lookup in each case: the work done does not depend on
     # whether, or why, the post is hidden.
-    assert [len(recorded) for recorded in statements] == [1, 1, 1]
-    assert statements[0] == statements[1] == statements[2]
+    assert [len(recorded) for recorded in statements] == [1, 1, 1, 1]
+    assert len({tuple(recorded) for recorded in statements}) == 1
 
 
 # --- who is asking -------------------------------------------------------
 
 
 def test_request_with_a_stale_cookie_is_answered_as_anonymous(
-    client: TestClient, session: Session, alice_account: User, bob_account: User
+    client: TestClient, make_client, session: Session, alice_account: User
 ) -> None:
-    public = add_post(session, alice_account)
-    make_private(session, bob_account)
-    private = add_post(session, bob_account)
+    post = add_post(session, alice_account)
+    expected = make_client().get(f"/posts/{post.id}").json()
     plant_session_cookie(client, "left-over-from-an-old-login")
 
-    # Not refused: public content stays readable. But nothing more than that.
-    assert client.get(f"/posts/{public.id}").status_code == 200
-    assert client.get(f"/posts/{private.id}").status_code == 404
+    response = client.get(f"/posts/{post.id}")
+
+    # Not refused: the post stays readable, as it is for anyone.
+    assert response.status_code == 200
+    assert response.json() == expected
 
 
-def test_expired_session_no_longer_shows_private_posts(
+def test_expired_session_is_answered_as_anonymous(
     alice_client: TestClient, session: Session, alice_account: User
 ) -> None:
-    make_private(session, alice_account)
     post = add_post(session, alice_account)
-    assert alice_client.get(f"/posts/{post.id}").status_code == 200
+    alice_client.post(f"/posts/{post.id}/like")
+    assert alice_client.get(f"/posts/{post.id}").json()["liked_by_me"] is True
 
     expire(session, session.scalars(select(UserSession)).one())
 
-    assert alice_client.get(f"/posts/{post.id}").status_code == 404
+    # Still readable, but no longer as alice.
+    response = alice_client.get(f"/posts/{post.id}")
+    assert response.status_code == 200
+    assert response.json()["like_count"] == 1
+    assert response.json()["liked_by_me"] is False
 
 
-def test_logging_out_hides_private_posts_again(
+def test_logging_out_leaves_the_post_readable_as_for_anyone(
     alice_client: TestClient, session: Session, alice_account: User
 ) -> None:
-    make_private(session, alice_account)
     post = add_post(session, alice_account)
-    assert alice_client.get(f"/posts/{post.id}").status_code == 200
+    alice_client.post(f"/posts/{post.id}/like")
+    assert alice_client.get(f"/posts/{post.id}").json()["liked_by_me"] is True
 
     alice_client.post("/auth/logout")
 
-    assert alice_client.get(f"/posts/{post.id}").status_code == 404
+    response = alice_client.get(f"/posts/{post.id}")
+    assert response.status_code == 200
+    assert response.json()["liked_by_me"] is False
 
 
 def test_viewer_cannot_be_named_by_the_request(
-    bob_client: TestClient, session: Session, alice_account: User
+    alice_client: TestClient,
+    bob_client: TestClient,
+    session: Session,
+    alice_account: User,
 ) -> None:
-    make_private(session, alice_account)
     post = add_post(session, alice_account)
+    alice_client.post(f"/posts/{post.id}/like")
 
     response = bob_client.get(
         f"/posts/{post.id}?viewer_id={alice_account.id}&user_id={alice_account.id}"
         "&username=alice&as=alice"
     )
 
-    assert response.status_code == 404
+    # Whose "by me" it is, is decided by the session and by nothing else.
+    assert response.status_code == 200
+    assert response.json()["like_count"] == 1
+    assert response.json()["liked_by_me"] is False
 
 
 # --- what a post must not contain ----------------------------------------

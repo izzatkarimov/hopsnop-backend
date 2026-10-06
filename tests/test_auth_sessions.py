@@ -61,7 +61,6 @@ def test_me_returns_safe_account_fields_only(alice_client: TestClient) -> None:
         "display_name",
         "bio",
         "avatar_url",
-        "is_private",
         "is_active",
         "email_verified_at",
         "created_at",

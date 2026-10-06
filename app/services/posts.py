@@ -26,7 +26,6 @@ from sqlalchemy import (
     exists,
     false,
     func,
-    or_,
     select,
 )
 from sqlalchemy.dialects.postgresql import insert
@@ -77,18 +76,13 @@ class UserNotFoundError(PostError):
     detail = "User not found."
 
 
-class PrivateAccountError(PostError):
-    status_code = 403
-    detail = "This account's posts are private."
-
-
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 # --- visibility ----------------------------------------------------------
 #
-# Who may see which posts is decided in this section and nowhere else. Every
+# Which posts are shown is decided in this section and nowhere else. Every
 # read below, and every check that a post "exists" for someone, goes through
 # ``_visible_posts``.
 
@@ -98,23 +92,6 @@ _ACCOUNT_IS_SHOWN = (
     User.is_active.is_(True),
     User.email_verified_at.is_not(None),
 )
-
-# An account whose posts are open to everyone.
-_ACCOUNT_IS_PUBLIC = User.is_private.is_(False)
-
-
-def _posts_readable_by(viewer: User | None) -> ColumnElement[bool]:
-    """Condition on a ``users`` row: may ``viewer`` read that account's posts?
-
-    ``viewer`` is None for a request that is not authenticated.
-
-    A public account's posts can be read by anyone. A private account's posts
-    can, for now, only be read by the account itself. Once following exists,
-    its approved followers are added here, and every query picks that up.
-    """
-    if viewer is None:
-        return _ACCOUNT_IS_PUBLIC
-    return or_(_ACCOUNT_IS_PUBLIC, User.id == viewer.id)
 
 
 # A like and a repost are the same thing to the database: a row that says
@@ -154,10 +131,15 @@ def _made_by(
 
 
 def _visible_posts(viewer: User | None) -> Select[tuple[Post]]:
-    """Every post ``viewer`` may see, each with its author, likes and reposts.
+    """Every post that is shown, each with its author, likes and reposts.
 
-    It is the author's account that decides, also for a reply: replying to a
-    public post does not make a private account's reply public.
+    A post is shown if it is not deleted and its author's account is shown.
+    That is the same for everyone: ``viewer`` (None for a request that is not
+    authenticated) decides nothing about which posts these are, only whether
+    each is liked and reposted "by me".
+
+    It is the author's account that decides, also for a reply: a reply is
+    shown or not on its own, whatever becomes of the post it answers.
 
     Of the author, only what a post shows is read from the database. Of the
     likes and reposts, only how many there are and whether ``viewer`` is
@@ -182,11 +164,7 @@ def _visible_posts(viewer: User | None) -> Select[tuple[Post]]:
             with_expression(Post.repost_count, _count_of(Repost, Post.id)),
             with_expression(Post.reposted_by_me, _made_by(Repost, Post.id, viewer)),
         )
-        .where(
-            Post.deleted_at.is_(None),
-            *_ACCOUNT_IS_SHOWN,
-            _posts_readable_by(viewer),
-        )
+        .where(Post.deleted_at.is_(None), *_ACCOUNT_IS_SHOWN)
     )
 
 
@@ -194,11 +172,11 @@ def _visible_posts(viewer: User | None) -> Select[tuple[Post]]:
 
 
 def get_post(db: Session, post_id: uuid.UUID, viewer: User | None) -> Post:
-    """The post with this id, if ``viewer`` may see it.
+    """The post with this id, if it is shown.
 
-    A post that does not exist, one that was deleted and one that the viewer
-    may not see are all the same "not found": one query that matches nothing,
-    so neither the answer nor the work done tells them apart.
+    A post that does not exist, one that was deleted and one whose author's
+    account is not shown are all the same "not found": one query that matches
+    nothing, so neither the answer nor the work done tells them apart.
     """
     post = db.scalar(_visible_posts(viewer).where(Post.id == post_id))
     if post is None:
@@ -217,23 +195,17 @@ def list_user_posts(
     """One page of the posts of the account with this (canonical) username.
 
     Newest first, replies included. An account that is not shown is not
-    found, exactly as for its profile. A private account's profile is public,
-    so here the account is acknowledged and reading its posts is refused.
+    found, exactly as for its profile.
     """
-    account = db.execute(
-        select(User.id, _posts_readable_by(viewer).label("posts_readable")).where(
-            User.username == username,
-            *_ACCOUNT_IS_SHOWN,
-        )
-    ).one_or_none()
-    if account is None:
+    account_id = db.scalar(
+        select(User.id).where(User.username == username, *_ACCOUNT_IS_SHOWN)
+    )
+    if account_id is None:
         raise UserNotFoundError
-    if not account.posts_readable:
-        raise PrivateAccountError
 
     return paginate(
         db,
-        _visible_posts(viewer).where(Post.author_id == account.id),
+        _visible_posts(viewer).where(Post.author_id == account_id),
         Post,
         limit=limit,
         after=after,
@@ -247,20 +219,18 @@ def list_for_you_feed(
     limit: int,
     after: Cursor | None = None,
 ) -> Page[Post]:
-    """One page of the For You feed: public accounts' posts, newest first.
+    """One page of the For You feed: every post that is shown, newest first.
 
     For now this is not a recommendation. It is every post that anyone may
     read, in the order they were written, with replies in it as the posts
-    they are.
+    they are. Whom ``viewer`` follows plays no part in it.
 
-    The feed is public content, so a private account's posts are in it for
-    nobody, the account itself included. That is a rule of this feed, and it
-    is applied on top of what ``viewer`` may see, not instead of it: whatever
-    ``_visible_posts`` hides from a viewer is hidden here as well.
+    The feed has no rule of its own about which posts are in it: whatever
+    ``_visible_posts`` leaves out is left out here, and nothing else is.
     """
     return paginate(
         db,
-        _visible_posts(viewer).where(_ACCOUNT_IS_PUBLIC),
+        _visible_posts(viewer),
         Post,
         limit=limit,
         after=after,
@@ -279,9 +249,9 @@ def create_post(
 ) -> Post:
     """Publish a post by ``author``, as a reply if ``parent_post_id`` is given.
 
-    A post can be replied to by whoever can see it. A parent that does not
-    exist, was deleted, or is hidden from the author is refused with one and
-    the same answer.
+    A post can be replied to while it is shown. A parent that does not
+    exist, was deleted, or is not shown is refused with one and the same
+    answer.
     """
     if parent_post_id is not None:
         parent = db.scalar(_visible_posts(author).where(Post.id == parent_post_id))

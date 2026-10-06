@@ -52,11 +52,6 @@ def all_posts(session: Session) -> dict[uuid.UUID, dict[str, object]]:
     }
 
 
-def make_private(session: Session, user: User) -> None:
-    user.is_private = True
-    session.flush()
-
-
 # --- the surface ---------------------------------------------------------
 
 
@@ -84,7 +79,7 @@ def test_the_only_post_routes_are_the_intended_ones() -> None:
 def test_nothing_from_later_phases_is_exposed() -> None:
     paths = " ".join(app.openapi()["paths"])
 
-    later_phases = ("follow", "stor", "upload", "media")
+    later_phases = ("stor", "upload", "media")
     for later in (*later_phases, "search", "notif", "mention", "hashtag"):
         assert later not in paths
 
@@ -178,7 +173,7 @@ def test_a_users_posts_can_only_be_read_through_their_listing(
 
 
 @pytest.mark.parametrize("method", ["PATCH", "DELETE"])
-def test_another_users_public_post_cannot_be_changed(
+def test_another_users_post_cannot_be_changed(
     alice_client: TestClient, session: Session, bob_account: User, method: str
 ) -> None:
     post = add_post(session, bob_account, "Bob's words")
@@ -194,11 +189,11 @@ def test_another_users_public_post_cannot_be_changed(
 
 
 @pytest.mark.parametrize("method", ["PATCH", "DELETE"])
-def test_another_users_private_post_cannot_be_changed_or_even_confirmed(
-    alice_client: TestClient, session: Session, bob_account: User, method: str
+def test_hidden_post_of_another_user_cannot_be_changed_or_even_confirmed(
+    alice_client: TestClient, session: Session, method: str
 ) -> None:
-    make_private(session, bob_account)
-    post = add_post(session, bob_account, "For my eyes only")
+    gone = add_user(session, "gone", active=False)
+    post = add_post(session, gone, "Not shown to anyone")
     before = all_posts(session)
 
     hidden = alice_client.request(
@@ -222,13 +217,11 @@ def test_write_attempts_cannot_be_used_to_probe_for_hidden_posts(
 ) -> None:
     deleted = add_post(session, bob_account, deleted=True)
     inactive = add_post(session, add_user(session, "inactive", active=False))
-    private_user = add_user(session, "private_user")
-    make_private(session, private_user)
-    private = add_post(session, private_user)
+    unverified = add_post(session, add_user(session, "unverified", verified=False))
 
     responses = [
         alice_client.request(method, f"/posts/{id}", json={"content": "Probe"})
-        for id in (uuid.uuid4(), deleted.id, inactive.id, private.id)
+        for id in (uuid.uuid4(), deleted.id, inactive.id, unverified.id)
     ]
 
     assert {response.status_code for response in responses} == {404}
@@ -306,10 +299,9 @@ def test_users_can_only_change_their_own_posts_in_both_directions(
 
 
 def test_refusal_does_not_depend_on_the_text_being_valid_for_hidden_posts(
-    alice_client: TestClient, session: Session, bob_account: User
+    alice_client: TestClient, session: Session
 ) -> None:
-    make_private(session, bob_account)
-    hidden = add_post(session, bob_account)
+    hidden = add_post(session, add_user(session, "gone", active=False))
 
     # An invalid text is rejected for what it is, whatever the id; a valid
     # one gets "not found". Neither tells a hidden post from no post.
@@ -367,7 +359,6 @@ def test_cross_site_change_is_rejected_and_has_no_effect(
 def test_cross_site_read_gets_no_cors_permission(
     alice_client: TestClient, session: Session, alice_account: User
 ) -> None:
-    make_private(session, alice_account)
     post = add_post(session, alice_account)
 
     response = alice_client.get(f"/posts/{post.id}", headers={"Origin": FOREIGN_ORIGIN})
@@ -461,8 +452,8 @@ def test_no_post_response_contains_a_secret(
     alice, bob, anonymous = make_client(), make_client(), make_client()
     log_in(alice, "alice")
     log_in(bob, "bob")
-    make_private(session, bob_account)
-    hidden = add_post(session, bob_account, "Hidden from alice")
+    gone = add_user(session, "gone", active=False)
+    hidden = add_post(session, gone, "Hidden from everyone")
     old = add_post(
         session,
         alice_account,
@@ -484,7 +475,7 @@ def test_no_post_response_contains_a_secret(
     call(anonymous, "GET", f"/posts/{post['id']}")
     call(bob, "GET", f"/posts/{post['id']}")
     call(alice, "GET", f"/posts/{hidden.id}")  # 404
-    call(bob, "GET", f"/posts/{hidden.id}")
+    call(anonymous, "GET", f"/posts/{hidden.id}")  # 404
     call(alice, "GET", "/posts/not-an-id")  # 422
     call(alice, "PATCH", f"/posts/{post['id']}", content="Edited")
     call(alice, "PATCH", f"/posts/{old.id}", content="Too late")  # 409
@@ -492,8 +483,9 @@ def test_no_post_response_contains_a_secret(
     call(anonymous, "PATCH", f"/posts/{post['id']}", content="Hacked")  # 401
     call(alice, "GET", "/users/alice/posts")
     call(anonymous, "GET", "/users/alice/posts?limit=1")
-    call(alice, "GET", "/users/bob/posts")  # 403
+    call(alice, "GET", "/users/bob/posts")
     call(bob, "GET", "/users/bob/posts")
+    call(alice, "GET", "/users/gone/posts")  # 404
     call(alice, "GET", "/users/nonexistent/posts")  # 404
     call(alice, "GET", "/users/alice/posts?cursor=abc")  # 400
     call(alice, "GET", "/users/alice/posts?limit=0")  # 422
@@ -530,10 +522,9 @@ def test_no_post_response_contains_a_secret(
         for name, value in response.headers.items():
             for secret in secrets:
                 assert secret not in value, (response.url, name)
-    # What is hidden from alice appears in none of her responses.
+    # What is not shown appears in no response, whoever asked.
     for response in responses:
-        if response.request.headers.get("cookie", "").endswith(session_tokens[0]):
-            assert "Hidden from alice" not in response.text, response.url
+        assert "Hidden from everyone" not in response.text, response.url
 
 
 def test_every_post_error_has_the_same_shape(
@@ -547,8 +538,6 @@ def test_every_post_error_has_the_same_shape(
     bobs = add_post(session, bob_account)
     two_hours_ago = datetime.now(timezone.utc) - timedelta(hours=2)
     old = add_post(session, alice_account, created_at=two_hours_ago)
-    private_user = add_user(session, "private_user")
-    make_private(session, private_user)
 
     errors = [
         alice_client.post("/posts", json={}),  # 422
@@ -557,7 +546,7 @@ def test_every_post_error_has_the_same_shape(
         alice_client.get(f"/posts/{uuid.uuid4()}"),  # 404
         alice_client.patch(f"/posts/{old.id}", json={"content": "x"}),  # 409
         alice_client.get("/users/alice/posts?cursor=abc"),  # 400
-        alice_client.get("/users/private_user/posts"),  # 403
+        alice_client.get("/users/nonexistent/posts"),  # 404
         alice_client.post(
             "/posts", json={"content": "x", "parent_post_id": str(uuid.uuid4())}
         ),  # 404
@@ -567,7 +556,7 @@ def test_every_post_error_has_the_same_shape(
     ]
 
     statuses = [response.status_code for response in errors]
-    assert statuses == [422, 401, 403, 404, 409, 400, 403, 404, 403]
+    assert statuses == [422, 401, 403, 404, 409, 400, 404, 404, 403]
     for response in errors:
         assert set(response.json()) == {"detail"}
         assert response.headers["content-type"] == "application/json"

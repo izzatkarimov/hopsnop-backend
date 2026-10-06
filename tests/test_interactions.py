@@ -32,7 +32,7 @@ INTERACTION_FIELDS = {"like_count", "liked_by_me", "repost_count", "reposted_by_
 START = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 MINUTE = timedelta(minutes=1)
 # Every reason a post cannot be read, and so cannot be liked or reposted.
-HIDDEN = ["nonexistent", "deleted", "private", "inactive", "unverified"]
+HIDDEN = ["nonexistent", "deleted", "inactive", "unverified"]
 # Every endpoint that returns existing posts.
 READS = ["single post", "user's posts", "feed"]
 
@@ -127,7 +127,7 @@ def add_posts(
 
 
 def hidden_post_id(session: Session, reason: str) -> uuid.UUID:
-    """The id of a post that nobody but its author, if anyone, can read."""
+    """The id of a post that nobody can read, its author included."""
     if reason == "nonexistent":
         return uuid.uuid4()
     author = add_user(
@@ -136,14 +136,7 @@ def hidden_post_id(session: Session, reason: str) -> uuid.UUID:
         verified=reason != "unverified",
         active=reason != "inactive",
     )
-    author.is_private = reason == "private"
-    session.flush()
     return add_post(session, author, "Hidden", deleted=reason == "deleted").id
-
-
-def make_private(session: Session, user: User) -> None:
-    user.is_private = True
-    session.flush()
 
 
 def read(client: TestClient, where: str, post_id: object, author: str = "alice"):
@@ -190,7 +183,7 @@ def ids(posts: list) -> list[str]:
 # --- making an interaction and taking it back ----------------------------
 
 
-def test_user_can_interact_with_a_public_post(
+def test_user_can_interact_with_another_users_post(
     bob_client: TestClient,
     session: Session,
     alice_account: User,
@@ -279,40 +272,28 @@ def test_reply_can_be_interacted_with_when_its_parent_no_longer_can(
     reply = add_post(
         session, bob_account, "Reply", parent=parent, created_at=START + MINUTE
     )
-    make_private(session, alice_account)
+    alice_account.is_active = False
+    session.flush()
 
     assert do(bob_client, kind, parent.id).status_code == 404
     assert do(bob_client, kind, reply.id).json() == state(kind, True, 1)
 
 
-def test_owner_can_interact_with_their_own_private_post(
+def test_author_and_anyone_else_can_interact_with_the_same_post(
     alice_client: TestClient,
     bob_client: TestClient,
     session: Session,
     alice_account: User,
     kind: Kind,
 ) -> None:
-    make_private(session, alice_account)
-    post = add_post(session, alice_account, "For my eyes only")
-
-    # She can read it, so she can like and repost it. Nobody else can.
-    assert do(alice_client, kind, post.id).json() == state(kind, True, 1)
-    assert do(bob_client, kind, post.id).status_code == 404
-    assert alice_client.get(f"/posts/{post.id}").json()[kind.by_me] is True
-    assert undo(alice_client, kind, post.id).json() == state(kind, False, 0)
-
-
-def test_private_account_can_interact_with_a_public_post(
-    bob_client: TestClient,
-    session: Session,
-    alice_account: User,
-    bob_account: User,
-    kind: Kind,
-) -> None:
     post = add_post(session, alice_account)
-    make_private(session, bob_account)
 
-    assert do(bob_client, kind, post.id).json() == state(kind, True, 1)
+    # Whoever can read a post can like and repost it, and everyone can read
+    # it: no account keeps its posts, or what is done with them, to itself.
+    assert do(alice_client, kind, post.id).json() == state(kind, True, 1)
+    assert do(bob_client, kind, post.id).json() == state(kind, True, 2)
+    assert alice_client.get(f"/posts/{post.id}").json()[kind.by_me] is True
+    assert undo(alice_client, kind, post.id).json() == state(kind, False, 1)
 
 
 def test_like_and_repost_are_independent(
@@ -841,26 +822,26 @@ def test_interacting_between_pages_causes_no_duplicates_or_gaps(
 
 
 def test_interactions_do_not_decide_what_is_in_the_feed(
-    bob_client: TestClient, session: Session, alice_account: User, bob_account: User
+    bob_client: TestClient, session: Session, alice_account: User
 ) -> None:
-    public = add_post(session, alice_account, "Public", created_at=START)
+    shown = add_post(session, alice_account, "Shown", created_at=START)
     deleted = add_post(
         session, alice_account, "Deleted", created_at=START + MINUTE, deleted=True
     )
-    make_private(session, bob_account)
-    private = add_post(session, bob_account, "Private", created_at=START + 2 * MINUTE)
-    # A deleted post and bob's own private post are the most popular there are.
+    gone = add_user(session, "gone", active=False)
+    hidden = add_post(session, gone, "Hidden", created_at=START + 2 * MINUTE)
+    # A deleted post and one of a deactivated account are the most popular
+    # there are.
     for fan in add_fans(session, 3):
         add_interaction(session, LIKE, fan, deleted)
         add_interaction(session, REPOST, fan, deleted)
-        add_interaction(session, LIKE, fan, private)
-    assert do(bob_client, LIKE, private.id).json() == state(LIKE, True, 4)
-    assert do(bob_client, REPOST, private.id).json() == state(REPOST, True, 1)
+        add_interaction(session, LIKE, fan, hidden)
+        add_interaction(session, REPOST, fan, hidden)
 
     response = bob_client.get("/feed")
 
-    assert ids(response.json()["items"]) == [str(public.id)]
-    assert "Private" not in response.text
+    assert ids(response.json()["items"]) == [str(shown.id)]
+    assert "Hidden" not in response.text
     assert "Deleted" not in response.text
 
 
@@ -1058,20 +1039,35 @@ def test_post_that_cannot_be_read_cannot_be_interacted_with(
     assert rows(session, kind) == 0
 
 
-def test_following_a_private_account_does_not_open_its_posts_to_interactions_yet(
+def test_following_plays_no_part_in_interacting_with_a_post(
     bob_client: TestClient,
     session: Session,
     alice_account: User,
     bob_account: User,
     kind: Kind,
-    method: str,
 ) -> None:
-    make_private(session, alice_account)
     post = add_post(session, alice_account)
-    follow(session, bob_account, alice_account)
 
-    assert change(bob_client, method, kind, post.id).status_code == 404
-    assert rows(session, kind) == 0
+    # Without following the author, and no differently once he does.
+    assert do(bob_client, kind, post.id).json() == state(kind, True, 1)
+    follow(session, bob_account, alice_account)
+    assert undo(bob_client, kind, post.id).json() == state(kind, False, 0)
+    assert do(bob_client, kind, post.id).json() == state(kind, True, 1)
+    assert rows(session, kind) == 1
+
+
+def test_no_profile_change_closes_a_post_to_interactions(
+    alice_client: TestClient, bob_client: TestClient, kind: Kind
+) -> None:
+    post = alice_client.post("/posts", json={"content": "Hello Hopsnop!"}).json()
+
+    # There is no privacy setting to switch on, alone or next to a real change.
+    alice_client.patch("/users/me", json={"is_private": True})
+    alice_client.patch("/users/me", json={"is_private": True, "bio": "Hi"})
+
+    assert do(bob_client, kind, post["id"]).json() == state(kind, True, 1)
+    assert bob_client.get(f"/posts/{post['id']}").json()[kind.by_me] is True
+    assert undo(bob_client, kind, post["id"]).json() == state(kind, False, 0)
 
 
 def test_deleted_post_cannot_be_interacted_with_by_its_own_author(
@@ -1087,7 +1083,7 @@ def test_deleted_post_cannot_be_interacted_with_by_its_own_author(
     assert rows(session, kind) == 0
 
 
-@pytest.mark.parametrize("how", ["deleted", "made private", "deactivated"])
+@pytest.mark.parametrize("how", ["deleted", "deactivated"])
 def test_interaction_cannot_be_changed_once_the_post_is_hidden(
     bob_client: TestClient,
     session: Session,
@@ -1101,8 +1097,6 @@ def test_interaction_cannot_be_changed_once_the_post_is_hidden(
 
     if how == "deleted":
         post.deleted_at = datetime.now(timezone.utc)
-    elif how == "made private":
-        alice_account.is_private = True
     else:
         alice_account.is_active = False
     session.flush()
@@ -1142,16 +1136,19 @@ def test_interaction_is_shown_again_when_the_post_can_be_read_again(
     alice_client: TestClient,
     bob_client: TestClient,
     session: Session,
+    alice_account: User,
     kind: Kind,
 ) -> None:
     post = alice_client.post("/posts", json={"content": "Now you see me"}).json()
     do(bob_client, kind, post["id"])
 
-    alice_client.patch("/users/me", json={"is_private": True})
+    alice_account.is_active = False
+    session.flush()
     assert bob_client.get(f"/posts/{post['id']}").status_code == 404
     assert undo(bob_client, kind, post["id"]).status_code == 404
 
-    alice_client.patch("/users/me", json={"is_private": False})
+    alice_account.is_active = True
+    session.flush()
     visible_again = bob_client.get(f"/posts/{post['id']}").json()
 
     assert (visible_again[kind.count], visible_again[kind.by_me]) == (1, True)

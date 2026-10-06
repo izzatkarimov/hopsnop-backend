@@ -16,7 +16,6 @@ def test_user_can_be_created(session: Session, alice: User) -> None:
     session.refresh(alice)
 
     assert isinstance(alice.id, uuid.UUID)
-    assert alice.is_private is False
     assert alice.is_active is True
     assert alice.bio is None
     assert alice.created_at.tzinfo is not None

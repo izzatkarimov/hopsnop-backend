@@ -100,20 +100,13 @@ def add_interaction(session: Session, kind: str, user: User, post: Post) -> None
     session.flush()
 
 
-def make_private(session: Session, user: User) -> None:
-    user.is_private = True
-    session.flush()
-
-
 def hidden_posts(session: Session) -> dict[str, Post]:
     """One post for each reason a post is hidden, each with a like and a repost."""
     authors = {
-        "private": add_user(session, "hidden_private"),
         "deleted": add_user(session, "hidden_deleted"),
         "inactive": add_user(session, "hidden_inactive", active=False),
         "unverified": add_user(session, "hidden_unverified", verified=False),
     }
-    make_private(session, authors["private"])
     posts = {
         reason: add_post(
             session, author, f"Hidden: {reason}", deleted=reason == "deleted"
@@ -251,10 +244,10 @@ def test_hidden_post_is_answered_exactly_like_one_that_does_not_exist(
 
     missing = change(bob_client, method, kind, uuid.uuid4())
     answers = [change(bob_client, method, kind, post.id) for post in hidden.values()]
-    reading = bob_client.get(f"/posts/{hidden['private'].id}")
+    reading = bob_client.get(f"/posts/{hidden['inactive'].id}")
 
-    # Not "forbidden", not "private", not "deleted": nothing about the answer
-    # says that there is a post behind the id, let alone what it has.
+    # Not "forbidden", not "deleted", not "deactivated": nothing about the
+    # answer says that there is a post behind the id, let alone what it has.
     for response in answers:
         assert response.status_code == missing.status_code == 404
         assert response.text == missing.text
@@ -268,7 +261,7 @@ def test_hidden_post_takes_the_same_statements_as_one_that_does_not_exist(
     bob_client: TestClient, session: Session, kind: str, method: str
 ) -> None:
     hidden = hidden_posts(session)
-    targets = [uuid.uuid4(), hidden["private"].id, hidden["deleted"].id]
+    targets = [uuid.uuid4(), hidden["inactive"].id, hidden["deleted"].id]
 
     recorded = []
     for post_id in targets:
@@ -297,7 +290,8 @@ def test_attempts_on_hidden_posts_cannot_be_told_apart_by_what_was_there_before(
     with_his = add_post(session, alice_account, "Hidden: with his")
     without_his = add_post(session, alice_account, "Hidden: without his")
     add_interaction(session, kind, bob_account, with_his)
-    make_private(session, alice_account)
+    alice_account.is_active = False
+    session.flush()
     before = all_interactions(session)
 
     answers = [
@@ -313,8 +307,8 @@ def test_anonymous_attempt_says_nothing_about_the_post(
     client: TestClient, session: Session, alice_account: User, kind: str, method: str
 ) -> None:
     hidden = hidden_posts(session)
-    public = add_post(session, alice_account)
-    targets = [uuid.uuid4(), public.id, hidden["private"].id, hidden["deleted"].id]
+    shown = add_post(session, alice_account)
+    targets = [uuid.uuid4(), shown.id, hidden["inactive"].id, hidden["deleted"].id]
 
     answers = [change(client, method, kind, post_id) for post_id in targets]
 
@@ -505,7 +499,7 @@ def test_cross_site_attempt_is_refused_before_the_post_is_looked_at(
 
     answers = [
         change(bob_client, method, kind, post_id, headers={"Origin": FOREIGN_ORIGIN})
-        for post_id in (uuid.uuid4(), hidden["private"].id)
+        for post_id in (uuid.uuid4(), hidden["inactive"].id)
     ]
 
     assert [response.status_code for response in answers] == [403, 403]
@@ -613,7 +607,7 @@ def test_no_interaction_response_contains_a_secret(
         call(bob, "DELETE", own)  # again
         call(anonymous, "POST", own)  # 401
         call(anonymous, "DELETE", own)  # 401
-        call(bob, "POST", f"/posts/{hidden['private'].id}/{kind}")  # 404
+        call(bob, "POST", f"/posts/{hidden['inactive'].id}/{kind}")  # 404
         call(bob, "DELETE", f"/posts/{hidden['deleted'].id}/{kind}")  # 404
         call(bob, "POST", f"/posts/{uuid.uuid4()}/{kind}")  # 404
         call(bob, "POST", f"/posts/not-an-id/{kind}")  # 422
@@ -676,7 +670,7 @@ def test_every_interaction_error_has_the_same_shape(
 
     errors = [
         change(make_client(), method, kind, uuid.uuid4()),  # 401
-        change(bob_client, method, kind, hidden["private"].id),  # 404
+        change(bob_client, method, kind, hidden["inactive"].id),  # 404
         change(bob_client, method, kind, "not-an-id"),  # 422
         change(bob_client, "PUT", kind, uuid.uuid4()),  # 405
         change(
@@ -767,7 +761,7 @@ def test_hidden_lookup_is_one_statement_like_reading_the_post(
     bob_client: TestClient, session: Session, kind: str, method: str
 ) -> None:
     hidden = hidden_posts(session)
-    post_id = hidden["private"].id
+    post_id = hidden["inactive"].id
     session.expunge_all()
 
     with recorded_selects() as reading:

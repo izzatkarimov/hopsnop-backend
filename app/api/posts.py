@@ -23,7 +23,7 @@ from app.schemas.post import (
 from app.services import posts as posts_service
 
 # What a post endpoint answers depends on who is asking and can stop being
-# true at any moment: a post is deleted, an account becomes private. No copy
+# true at any moment: a post is deleted, an account is deactivated. No copy
 # of an answer should outlive that.
 router = APIRouter(prefix="/posts", tags=["posts"], dependencies=[Depends(no_store)])
 
@@ -49,9 +49,10 @@ def create_post(
 
 @router.get("/{post_id}", response_model=PostResponse)
 def get_post(post_id: uuid.UUID, viewer: OptionalUser, db: DbSession) -> PostResponse:
-    """A single post. No authentication is needed for a public account's post.
+    """A single post. No authentication is needed.
 
-    A post that was deleted, or that the caller may not see, is not found.
+    A post that was deleted, or whose author's account is not shown, is not
+    found.
     """
     return PostResponse.model_validate(posts_service.get_post(db, post_id, viewer))
 

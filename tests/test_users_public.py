@@ -17,9 +17,9 @@ PUBLIC_FIELDS = {
     "display_name",
     "bio",
     "avatar_url",
-    "is_private",
     "followers_count",
     "following_count",
+    "following",
     "created_at",
 }
 NOT_FOUND = {"detail": "User not found."}
@@ -47,9 +47,9 @@ def test_public_profile_returns_the_users_profile(
         "display_name": "Alice Smith",
         "bio": "Hello, Hopsnop!",
         "avatar_url": "https://cdn.example.com/avatars/alice.png",
-        "is_private": False,
         "followers_count": 0,
         "following_count": 0,
+        "following": False,
     }
 
 
@@ -94,22 +94,20 @@ def test_username_lookup_uses_the_canonical_username(
     assert response.json()["username"] == "alice"
 
 
-def test_profile_of_a_private_account_is_still_visible(
-    client: TestClient, session: Session, alice_account: User
+def test_profile_says_nothing_about_account_privacy(
+    make_client, alice_account: User, bob_account: User
 ) -> None:
-    alice_account.is_private = True
-    alice_account.bio = "Private, but findable."
-    session.flush()
+    anonymous, bob, alice = make_client(), make_client(), make_client()
+    log_in(bob, "bob")
+    log_in(alice, "alice")
 
-    response = client.get("/users/alice")
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["is_private"] is True
-    assert set(body) == PUBLIC_FIELDS
-    assert body["username"] == "alice"
-    assert body["display_name"] == "Alice"
-    assert body["bio"] == "Private, but findable."
+    # There are no public and private accounts, so no profile says which.
+    for viewer in (anonymous, bob, alice):
+        response = viewer.get("/users/alice")
+        assert response.status_code == 200
+        assert set(response.json()) == PUBLIC_FIELDS
+        for word in ("is_private", "private", "privacy", "visibility"):
+            assert word not in response.text
 
 
 # --- what a public profile must not contain ------------------------------
@@ -121,7 +119,7 @@ def test_public_profile_contains_exactly_the_public_fields(
     assert set(client.get("/users/alice").json()) == PUBLIC_FIELDS
 
 
-def test_public_profile_does_not_expose_private_account_data(
+def test_public_profile_does_not_expose_owner_only_account_data(
     make_client, session: Session, alice_account: User
 ) -> None:
     # Give alice a live session, so that there is session data to leak.

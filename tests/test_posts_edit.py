@@ -143,16 +143,6 @@ def test_edit_only_changes_the_post_it_names(
     assert post_columns(session, uuid.UUID(second["id"])) == before
 
 
-def test_owner_of_a_private_account_can_edit_their_post(
-    alice_client: TestClient, session: Session, alice_account: User
-) -> None:
-    alice_account.is_private = True
-    session.flush()
-    post = create(alice_client)
-
-    assert edit(alice_client, post["id"]).status_code == 200
-
-
 def test_edit_responses_are_not_to_be_cached(alice_client: TestClient) -> None:
     post = create(alice_client)
 

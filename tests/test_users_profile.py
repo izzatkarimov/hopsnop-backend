@@ -14,7 +14,6 @@ MY_FIELDS = {
     "display_name",
     "bio",
     "avatar_url",
-    "is_private",
     "email_verified_at",
     "followers_count",
     "following_count",
@@ -43,7 +42,7 @@ def test_authenticated_user_can_get_their_own_profile(
     assert datetime.fromisoformat(body["created_at"]) == alice_account.created_at
 
 
-def test_own_profile_includes_the_private_account_fields(
+def test_own_profile_includes_the_owner_only_fields(
     alice_client: TestClient, alice_account: User
 ) -> None:
     body = alice_client.get("/users/me").json()
@@ -156,20 +155,6 @@ def test_avatar_url_can_be_updated(
     assert columns(session, alice_account)["avatar_url"] == url
 
 
-@pytest.mark.parametrize("is_private", [True, False])
-def test_privacy_flag_can_be_updated(
-    alice_client: TestClient, session: Session, alice_account: User, is_private: bool
-) -> None:
-    alice_account.is_private = not is_private
-    session.flush()
-
-    response = patch(alice_client, is_private=is_private)
-
-    assert response.status_code == 200
-    assert response.json()["is_private"] is is_private
-    assert columns(session, alice_account)["is_private"] is is_private
-
-
 def test_several_fields_can_be_updated_at_once(
     alice_client: TestClient, session: Session, alice_account: User
 ) -> None:
@@ -177,7 +162,6 @@ def test_several_fields_can_be_updated_at_once(
         "display_name": "Alice Smith",
         "bio": "Hello, Hopsnop!",
         "avatar_url": "https://cdn.example.com/avatars/alice.png",
-        "is_private": True,
     }
 
     response = patch(alice_client, **changes)
@@ -204,12 +188,12 @@ def test_update_returns_the_whole_own_profile(
 def test_update_is_visible_on_the_public_profile(
     make_client, alice_client: TestClient
 ) -> None:
-    patch(alice_client, display_name="Alice Smith", is_private=True)
+    patch(alice_client, display_name="Alice Smith", bio="Hello, Hopsnop!")
 
     body = make_client().get("/users/alice").json()
 
     assert body["display_name"] == "Alice Smith"
-    assert body["is_private"] is True
+    assert body["bio"] == "Hello, Hopsnop!"
 
 
 # --- PATCH semantics -----------------------------------------------------
@@ -221,7 +205,6 @@ def test_update_is_visible_on_the_public_profile(
         {"display_name": "Alice Smith"},
         {"bio": "New bio"},
         {"avatar_url": "https://cdn.example.com/new.png"},
-        {"is_private": False},
     ],
 )
 def test_omitted_fields_remain_unchanged(
@@ -229,7 +212,6 @@ def test_omitted_fields_remain_unchanged(
 ) -> None:
     alice_account.bio = "Original bio"
     alice_account.avatar_url = "https://cdn.example.com/original.png"
-    alice_account.is_private = True
     session.flush()
     before = columns(session, alice_account)
 
@@ -268,13 +250,12 @@ def test_null_clears_the_avatar_url(
     assert columns(session, alice_account)["avatar_url"] is None
 
 
-@pytest.mark.parametrize("field", ["display_name", "is_private"])
-def test_fields_that_cannot_be_empty_reject_null(
-    alice_client: TestClient, session: Session, alice_account: User, field: str
+def test_display_name_cannot_be_cleared_with_null(
+    alice_client: TestClient, session: Session, alice_account: User
 ) -> None:
     before = columns(session, alice_account)
 
-    response = patch(alice_client, **{field: None})
+    response = patch(alice_client, display_name=None)
 
     assert response.status_code == 422
     assert columns(session, alice_account) == before
@@ -295,7 +276,8 @@ def test_request_without_any_change_is_rejected(
 def test_empty_request_says_what_is_expected(alice_client: TestClient) -> None:
     [error] = alice_client.patch("/users/me", json={}).json()["detail"]
 
-    assert "At least one of display_name, bio, avatar_url or is_private" in error["msg"]
+    assert "At least one of display_name, bio or avatar_url" in error["msg"]
+    assert "is_private" not in error["msg"]
 
 
 def test_invalid_field_keeps_the_valid_ones_from_being_applied(
@@ -469,17 +451,46 @@ def test_avatar_url_is_stored_in_normalized_form(
     assert stored == "https://cdn.example.com/Avatars/A.png"
 
 
-# --- privacy flag --------------------------------------------------------
+# --- there is no privacy setting -----------------------------------------
+#
+# An account is not public or private. `is_private` is no field of a profile:
+# like any other name the API does not know, it is not read.
 
 
-@pytest.mark.parametrize("is_private", ["true", "yes", 1, 0, "false", [True]])
-def test_privacy_flag_must_be_a_boolean(
+@pytest.mark.parametrize("is_private", [True, False, "true", 1, None])
+def test_is_private_sent_alone_is_an_empty_update(
     alice_client: TestClient, session: Session, alice_account: User, is_private: object
 ) -> None:
+    before = columns(session, alice_account)
+
     response = patch(alice_client, is_private=is_private)
 
+    # With nothing editable in it, the request changes nothing and says so.
     assert response.status_code == 422
-    assert columns(session, alice_account)["is_private"] is False
+    [error] = response.json()["detail"]
+    assert "At least one of display_name, bio or avatar_url" in error["msg"]
+    assert columns(session, alice_account) == before
+
+
+@pytest.mark.parametrize("is_private", [True, False])
+def test_is_private_sent_with_a_valid_change_is_not_read(
+    alice_client: TestClient, session: Session, alice_account: User, is_private: bool
+) -> None:
+    before = columns(session, alice_account)
+
+    response = patch(alice_client, bio="Changed", is_private=is_private)
+
+    assert response.status_code == 200
+    assert set(response.json()) == MY_FIELDS
+    assert "is_private" not in keys_in(response.json())
+    after = columns(session, alice_account)
+    assert after["bio"] == "Changed"
+    changed = {name for name in before if before[name] != after[name]}
+    assert changed <= {"bio", "updated_at"}
+    # Nowhere to keep it: neither the account nor its row has such a thing.
+    assert "is_private" not in after
+    assert "is_private" not in alice_client.get("/users/me").json()
+    assert "is_private" not in alice_client.get("/users/alice").json()
 
 
 # --- timestamps ----------------------------------------------------------

@@ -142,7 +142,6 @@ class AccountResponse(BaseModel):
     display_name: str
     bio: str | None
     avatar_url: str | None
-    is_private: bool
     is_active: bool
     email_verified_at: datetime | None
     created_at: datetime

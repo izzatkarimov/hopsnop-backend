@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import Post, User
-from helpers import add_post, add_user, log_in, post_columns
+from helpers import add_post, add_user, post_columns
 
 NOT_FOUND = {"detail": "Post not found."}
 PARENT_NOT_FOUND = {"detail": "Parent post not found."}
@@ -30,11 +30,6 @@ def reply(client: TestClient, parent_id: object, content: object = "Nice post!")
 
 def post_count(session: Session) -> int:
     return session.scalar(select(func.count()).select_from(Post))
-
-
-def make_private(session: Session, user: User) -> None:
-    user.is_private = True
-    session.flush()
 
 
 # --- replying ------------------------------------------------------------
@@ -214,41 +209,34 @@ def test_cannot_reply_to_a_deleted_post(
     assert post_count(session) == 1
 
 
-def test_cannot_reply_to_a_private_accounts_post(
-    alice_client: TestClient,
-    bob_client: TestClient,
-    session: Session,
-    alice_account: User,
-) -> None:
-    make_private(session, alice_account)
-    post = create(alice_client, "For my eyes only")
-
-    response = reply(bob_client, post["id"])
-
-    assert response.status_code == 404
-    assert response.json() == PARENT_NOT_FOUND
-    assert "For my eyes only" not in response.text
-    assert post_count(session) == 1
-
-
-def test_owner_of_a_private_account_can_reply_to_their_own_post(
-    alice_client: TestClient, session: Session, alice_account: User
-) -> None:
-    make_private(session, alice_account)
-    post = create(alice_client)
-
-    assert reply(alice_client, post["id"]).status_code == 201
-
-
-def test_cannot_reply_to_a_post_that_became_private(
+def test_no_profile_change_closes_a_post_to_replies(
     alice_client: TestClient, bob_client: TestClient
 ) -> None:
     post = create(alice_client)
     assert reply(bob_client, post["id"]).status_code == 201
 
+    # There is no privacy setting to switch on, alone or next to a real change.
     alice_client.patch("/users/me", json={"is_private": True})
+    alice_client.patch("/users/me", json={"is_private": True, "bio": "Hi"})
 
-    assert reply(bob_client, post["id"]).status_code == 404
+    assert reply(bob_client, post["id"]).status_code == 201
+
+
+def test_cannot_reply_to_a_post_once_its_author_is_deactivated(
+    alice_client: TestClient,
+    bob_client: TestClient,
+    session: Session,
+    alice_account: User,
+) -> None:
+    post = create(alice_client)
+    assert reply(bob_client, post["id"]).status_code == 201
+
+    alice_account.is_active = False
+    session.flush()
+
+    response = reply(bob_client, post["id"])
+    assert response.status_code == 404
+    assert response.json() == PARENT_NOT_FOUND
 
 
 def test_cannot_reply_to_a_post_of_a_deactivated_account(
@@ -265,14 +253,12 @@ def test_every_parent_that_cannot_be_replied_to_gives_the_same_answer(
     bob_client: TestClient, session: Session, alice_account: User
 ) -> None:
     deleted = add_post(session, alice_account, deleted=True)
-    private_user = add_user(session, "private_user")
-    make_private(session, private_user)
-    private = add_post(session, private_user)
     inactive = add_post(session, add_user(session, "inactive", active=False))
+    unverified = add_post(session, add_user(session, "unverified", verified=False))
 
     responses = [
         reply(bob_client, id)
-        for id in (uuid.uuid4(), deleted.id, private.id, inactive.id)
+        for id in (uuid.uuid4(), deleted.id, inactive.id, unverified.id)
     ]
 
     # A reply attempt cannot be used to find out which ids are posts.
@@ -424,82 +410,89 @@ def test_reply_is_deleted_like_any_post(
     assert reply(alice_client, created["id"]).status_code == 404
 
 
-# --- whose privacy governs a reply ---------------------------------------
+# --- a reply is shown, or not, on its own --------------------------------
+#
+# It is a reply's own author whose account decides, never the parent's.
 
 
-def test_reply_by_a_private_account_to_a_public_post_stays_private(
+def test_reply_of_an_account_that_is_no_longer_shown_is_hidden_on_its_own(
     alice_client: TestClient,
     bob_client: TestClient,
     make_client,
     session: Session,
     bob_account: User,
 ) -> None:
-    post = create(alice_client, "Public post")
-    make_private(session, bob_account)
-
-    created = reply(bob_client, post["id"], "Private reply")
-
+    post = create(alice_client, "The post")
+    created = reply(bob_client, post["id"], "The reply")
     assert created.status_code == 201
     reply_id = created.json()["id"]
+    anonymous = make_client()
+    assert anonymous.get(f"/posts/{reply_id}").status_code == 200
+
+    bob_account.is_active = False
+    session.flush()
+
     # Not even the author of the post that was replied to can read it.
-    for viewer in (make_client(), alice_client):
+    for viewer in (anonymous, alice_client):
         response = viewer.get(f"/posts/{reply_id}")
         assert response.status_code == 404
         assert response.json() == NOT_FOUND
-    assert bob_client.get(f"/posts/{reply_id}").status_code == 200
+    # Being answered by such a reply changes nothing about the post.
+    assert anonymous.get(f"/posts/{post['id']}").status_code == 200
 
 
-def test_private_reply_cannot_be_replied_to_by_others(
+def test_reply_of_an_account_that_is_no_longer_shown_cannot_be_replied_to(
     alice_client: TestClient,
     bob_client: TestClient,
     session: Session,
     bob_account: User,
 ) -> None:
     post = create(alice_client)
-    make_private(session, bob_account)
-    private_reply = reply(bob_client, post["id"]).json()
+    hidden_reply = reply(bob_client, post["id"]).json()
+    assert reply(alice_client, hidden_reply["id"]).status_code == 201
 
-    assert reply(alice_client, private_reply["id"]).status_code == 404
-    assert reply(bob_client, private_reply["id"]).status_code == 201
+    bob_account.is_active = False
+    session.flush()
+
+    assert reply(alice_client, hidden_reply["id"]).status_code == 404
+    assert reply(alice_client, post["id"]).status_code == 201
 
 
-def test_public_reply_stays_visible_when_its_parent_becomes_private(
-    alice_client: TestClient, bob_client: TestClient, make_client
+def test_reply_stays_visible_when_its_parents_author_is_no_longer_shown(
+    alice_client: TestClient,
+    bob_client: TestClient,
+    make_client,
+    session: Session,
+    alice_account: User,
 ) -> None:
     post = create(alice_client)
     created = reply(bob_client, post["id"]).json()
 
-    alice_client.patch("/users/me", json={"is_private": True})
+    alice_account.is_active = False
+    session.flush()
     anonymous = make_client()
 
-    # The reply is bob's and bob is public. The parent is alice's and hidden.
+    # The reply is bob's and bob is shown. The parent is alice's and hidden.
     assert anonymous.get(f"/posts/{created['id']}").status_code == 200
     assert anonymous.get(f"/posts/{post['id']}").status_code == 404
 
 
 def test_reply_does_not_carry_its_parents_content(
-    alice_client: TestClient, bob_client: TestClient, make_client
+    alice_client: TestClient,
+    bob_client: TestClient,
+    make_client,
+    session: Session,
+    alice_account: User,
 ) -> None:
     post = create(alice_client, "Soon to be hidden")
     created = reply(bob_client, post["id"], "Reply").json()
-    alice_client.patch("/users/me", json={"is_private": True})
+    alice_account.is_active = False
+    session.flush()
 
     response = make_client().get(f"/posts/{created['id']}")
 
     # Only the parent's id, which opens nothing for someone who cannot see it.
+    assert response.status_code == 200
+    assert response.json()["parent_post_id"] == post["id"]
     assert "Soon to be hidden" not in response.text
     assert "alice" not in response.text
-
-
-def test_private_accounts_see_only_their_own_side_of_a_conversation(
-    make_client, session: Session, alice_account: User, bob_account: User
-) -> None:
-    make_private(session, alice_account)
-    make_private(session, bob_account)
-    alice, bob = make_client(), make_client()
-    log_in(alice, "alice")
-    log_in(bob, "bob")
-    post = create(alice)
-
-    assert reply(bob, post["id"]).status_code == 404
-    assert reply(alice, post["id"]).status_code == 201

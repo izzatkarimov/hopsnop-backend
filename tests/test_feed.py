@@ -53,7 +53,7 @@ IMPOSSIBLE_TIME_CURSOR = base64.urlsafe_b64encode(
     struct.pack(">q16s", 2**63 - 1, bytes(16))
 ).decode("ascii")
 # Every reason a post is kept out of the feed.
-HIDDEN = ["deleted", "private", "inactive", "unverified"]
+HIDDEN = ["deleted", "inactive", "unverified"]
 
 
 def feed(client: TestClient, **params: object):
@@ -97,8 +97,6 @@ def add_hidden_post(
             verified=kind != "unverified",
             active=kind != "inactive",
         )
-        author.is_private = kind == "private"
-        session.flush()
     return add_post(
         session,
         author,
@@ -128,11 +126,6 @@ def walk(
         if cursor is None:
             return pages
         assert len(pages) < 200, "pagination does not terminate"
-
-
-def make_private(session: Session, user: User) -> None:
-    user.is_private = True
-    session.flush()
 
 
 # --- the feed ------------------------------------------------------------
@@ -191,19 +184,18 @@ def test_feed_is_the_same_for_every_viewer(
     add_posts(session, 3, alice_account)
     add_posts(session, 2, bob_account, start=START + timedelta(seconds=30))
     carol = add_user(session, "carol")
-    make_private(session, carol)
-    add_post(session, carol, "For my eyes only")
-    anonymous, alice, bob, private_owner = (make_client() for _ in range(4))
-    for viewer, name in ((alice, "alice"), (bob, "bob"), (private_owner, "carol")):
+    add_post(session, carol, "Carol's post", created_at=START - MINUTE)
+    anonymous, alice, bob, carols = (make_client() for _ in range(4))
+    for viewer, name in ((alice, "alice"), (bob, "bob"), (carols, "carol")):
         assert log_in(viewer, name).status_code == 200
 
-    seen = [feed(viewer).json() for viewer in (anonymous, alice, bob, private_owner)]
+    seen = [feed(viewer).json() for viewer in (anonymous, alice, bob, carols)]
 
     assert seen[0] == seen[1] == seen[2] == seen[3]
-    assert len(seen[0]["items"]) == 5
+    assert len(seen[0]["items"]) == 6
 
 
-def test_feed_mixes_the_posts_of_all_public_accounts_by_time(
+def test_feed_mixes_the_posts_of_all_accounts_by_time(
     client: TestClient, session: Session, alice_account: User, bob_account: User
 ) -> None:
     carol = add_user(session, "carol")
@@ -321,83 +313,64 @@ def test_feed_responses_are_not_to_be_cached(
 # --- which posts are in it -----------------------------------------------
 
 
-def test_post_of_a_public_active_verified_account_appears(
+def test_post_of_an_active_verified_account_appears(
     client: TestClient, session: Session, alice_account: User
 ) -> None:
     post = add_post(session, alice_account)
-    assert alice_account.is_private is False
     assert alice_account.is_active is True
     assert alice_account.email_verified_at is not None
 
     assert ids(feed(client).json()["items"]) == [str(post.id)]
 
 
-def test_private_accounts_posts_do_not_appear(
-    client: TestClient, session: Session, alice_account: User, bob_account: User
+def test_every_shown_accounts_posts_are_in_the_feed_for_everyone(
+    make_client, session: Session, alice_account: User, bob_account: User
 ) -> None:
-    make_private(session, alice_account)
-    add_post(session, alice_account, "For my eyes only")
-    public = add_post(session, bob_account, "For everyone")
+    carol = add_user(session, "carol")
+    posts = add_posts(session, 6, alice_account, bob_account, carol)
+    anonymous, alice, bob = make_client(), make_client(), make_client()
+    log_in(alice, "alice")
+    log_in(bob, "bob")
 
-    response = feed(client)
-
-    assert ids(response.json()["items"]) == [str(public.id)]
-    assert "For my eyes only" not in response.text
-
-
-def test_private_accounts_posts_do_not_appear_for_a_signed_in_user(
-    bob_client: TestClient, session: Session, alice_account: User
-) -> None:
-    make_private(session, alice_account)
-    add_post(session, alice_account, "For my eyes only")
-
-    response = feed(bob_client)
-
-    assert response.status_code == 200
-    assert response.json() == EMPTY
+    # No account is public or private: being shown is all it takes, and the
+    # author of a post finds it here like anyone else.
+    for viewer in (anonymous, alice, bob):
+        response = feed(viewer)
+        assert ids(response.json()["items"]) == ids(posts)
+        assert "private" not in response.text
 
 
-def test_private_accounts_posts_are_not_in_the_feed_even_for_that_account(
-    alice_client: TestClient, session: Session, alice_account: User, bob_account: User
-) -> None:
-    make_private(session, alice_account)
-    own = add_post(session, alice_account, "For my eyes only")
-    public = add_post(session, bob_account, "For everyone")
-
-    response = feed(alice_client)
-
-    # The feed is public content. Her post is not hidden from her; it is
-    # only not part of this feed.
-    assert ids(response.json()["items"]) == [str(public.id)]
-    assert "For my eyes only" not in response.text
-    assert alice_client.get(f"/posts/{own.id}").status_code == 200
-    own_posts = alice_client.get("/users/alice/posts").json()["items"]
-    assert ids(own_posts) == [str(own.id)]
-
-
-def test_following_a_private_account_does_not_bring_its_posts_into_the_feed(
-    bob_client: TestClient, session: Session, alice_account: User, bob_account: User
-) -> None:
-    make_private(session, alice_account)
-    add_post(session, alice_account, "For my followers")
-    follow(session, bob_account, alice_account)
-
-    assert feed(bob_client).json() == EMPTY
-
-
-def test_feed_follows_the_accounts_current_privacy_setting(
+def test_no_profile_change_takes_an_accounts_posts_out_of_the_feed(
     alice_client: TestClient, make_client, session: Session, alice_account: User
 ) -> None:
     posts = add_posts(session, 2, alice_account)
     anonymous = make_client()
-    assert ids(feed(anonymous).json()["items"]) == ids(posts)
+    before = feed(anonymous).json()
 
-    alice_client.patch("/users/me", json={"is_private": True})
-    assert feed(anonymous).json() == EMPTY
-    assert feed(alice_client).json() == EMPTY
+    # There is no privacy setting to switch on, alone or next to a real change.
+    alone = alice_client.patch("/users/me", json={"is_private": True})
+    beside = alice_client.patch("/users/me", json={"is_private": True, "bio": "Hi"})
 
-    alice_client.patch("/users/me", json={"is_private": False})
-    assert ids(feed(anonymous).json()["items"]) == ids(posts)
+    assert feed(anonymous).json() == before
+    assert ids(feed(alice_client).json()["items"]) == ids(before["items"]) == ids(posts)
+    assert (alone.status_code, beside.status_code) == (422, 200)
+
+
+def test_following_changes_nothing_about_the_feed(
+    bob_client: TestClient, session: Session, alice_account: User, bob_account: User
+) -> None:
+    carol = add_user(session, "carol")
+    posts = add_posts(session, 6, alice_account, carol)
+    before = feed(bob_client).json()
+
+    follow(session, bob_account, alice_account)
+
+    # For You is not the Following feed: the followed are neither the only
+    # ones in it nor the first.
+    assert feed(bob_client).json() == before
+    assert ids(before["items"]) == ids(posts)
+    authors = [item["author"]["username"] for item in before["items"]]
+    assert authors == ["carol", "alice"] * 3
 
 
 def test_deleted_posts_do_not_appear(
@@ -474,7 +447,6 @@ def test_feed_holds_exactly_the_posts_that_pass_every_rule(
         add_hidden_post(session, kind, f"Hidden: {kind}", created_at=between)
     # Hidden for every reason at once.
     several = add_user(session, "several", verified=False, active=False)
-    make_private(session, several)
     add_post(session, several, "Hidden: several", deleted=True)
     bob = make_client()
     log_in(bob, "bob")
@@ -500,7 +472,7 @@ def test_stale_cookie_is_answered_as_anonymous(
 
     response = feed(client)
 
-    # Not refused: public content stays readable.
+    # Not refused: the feed stays readable, as it is for anyone.
     assert response.status_code == 200
     assert ids(response.json()["items"]) == ids(posts)
 
@@ -544,18 +516,24 @@ def test_logging_out_changes_nothing_about_the_feed(
 
 
 def test_viewer_cannot_be_named_by_the_request(
-    bob_client: TestClient, session: Session, alice_account: User
+    alice_client: TestClient,
+    bob_client: TestClient,
+    session: Session,
+    alice_account: User,
 ) -> None:
-    make_private(session, alice_account)
-    add_post(session, alice_account, "For my eyes only")
+    post = add_post(session, alice_account)
+    alice_client.post(f"/posts/{post.id}/like")
 
     response = bob_client.get(
         f"/feed?viewer_id={alice_account.id}&user_id={alice_account.id}"
         "&username=alice&as=alice"
     )
 
+    # Whose "by me" it is, is decided by the session and by nothing else.
     assert response.status_code == 200
-    assert response.json() == EMPTY
+    [item] = response.json()["items"]
+    assert item["like_count"] == 1
+    assert item["liked_by_me"] is False
 
 
 # --- replies -------------------------------------------------------------
@@ -639,41 +617,42 @@ def test_nested_replies_each_point_at_their_direct_parent(
 def test_reply_follows_its_own_authors_account(
     client: TestClient, session: Session, alice_account: User, kind: str
 ) -> None:
-    parent = add_post(session, alice_account, "Public post", created_at=START)
+    parent = add_post(session, alice_account, "The post", created_at=START)
     add_hidden_post(
         session, kind, "Hidden reply", parent=parent, created_at=START + MINUTE
     )
 
     response = feed(client)
 
-    # Answering a public post does not make a reply public.
+    # Answering a post that is shown does not make a reply shown.
     assert ids(response.json()["items"]) == [str(parent.id)]
     assert "Hidden reply" not in response.text
 
 
-def test_private_accounts_reply_is_not_shown_even_to_the_author_it_answers(
-    alice_client: TestClient, session: Session, alice_account: User, bob_account: User
+@pytest.mark.parametrize("kind", HIDDEN)
+def test_hidden_reply_is_not_shown_even_to_the_author_it_answers(
+    alice_client: TestClient, session: Session, alice_account: User, kind: str
 ) -> None:
-    parent = add_post(session, alice_account, "Public post", created_at=START)
-    make_private(session, bob_account)
-    add_post(
-        session, bob_account, "Private reply", parent=parent, created_at=START + MINUTE
+    parent = add_post(session, alice_account, "The post", created_at=START)
+    add_hidden_post(
+        session, kind, "Hidden reply", parent=parent, created_at=START + MINUTE
     )
 
     response = feed(alice_client)
 
     assert ids(response.json()["items"]) == [str(parent.id)]
-    assert "Private reply" not in response.text
+    assert "Hidden reply" not in response.text
 
 
-def test_public_reply_stays_in_the_feed_when_its_parent_becomes_private(
+def test_reply_stays_in_the_feed_when_its_parents_author_is_no_longer_shown(
     client: TestClient, session: Session, alice_account: User, bob_account: User
 ) -> None:
-    parent = add_post(session, alice_account, "Now private", created_at=START)
+    parent = add_post(session, alice_account, "Now hidden", created_at=START)
     reply = add_post(
-        session, bob_account, "Public reply", parent=parent, created_at=START + MINUTE
+        session, bob_account, "The reply", parent=parent, created_at=START + MINUTE
     )
-    make_private(session, alice_account)
+    alice_account.is_active = False
+    session.flush()
 
     response = feed(client)
 
@@ -682,7 +661,7 @@ def test_public_reply_stays_in_the_feed_when_its_parent_becomes_private(
     # The id of the parent, which the reply had all along, and nothing of
     # what the parent says.
     assert item["parent_post_id"] == str(parent.id)
-    assert "Now private" not in response.text
+    assert "Now hidden" not in response.text
 
 
 def test_deleting_the_parent_does_not_remove_a_reply_from_the_feed(
@@ -842,7 +821,7 @@ def test_cursor_is_the_position_of_the_last_post_shown(
     last_shown = posts[1]
     # The rows right before and after it in the table are not in the feed.
     second = timedelta(seconds=1)
-    add_hidden_post(session, "private", created_at=last_shown.created_at + second)
+    add_hidden_post(session, "inactive", created_at=last_shown.created_at + second)
     add_hidden_post(session, "deleted", created_at=last_shown.created_at - second)
 
     cursor = feed(client, limit=2).json()["next_cursor"]
@@ -901,7 +880,7 @@ def test_walking_the_pages_shows_every_visible_post_and_no_hidden_one(
     visible = add_posts(session, 12, alice_account, bob_account)
     for number in range(12):
         after = START + number * MINUTE + timedelta(seconds=30)
-        add_hidden_post(session, HIDDEN[number % 4], created_at=after)
+        add_hidden_post(session, HIDDEN[number % len(HIDDEN)], created_at=after)
 
     pages = walk(client, limit=limit)
 
@@ -1005,22 +984,14 @@ def test_posts_deleted_between_requests_cause_no_duplicates_or_gaps(
     assert rest == ids([posts[3], posts[5], posts[6], posts[7]])
 
 
-@pytest.mark.parametrize("change", ["private", "deactivated"])
-def test_account_hidden_between_requests_is_gone_from_the_pages_that_follow(
-    client: TestClient,
-    session: Session,
-    alice_account: User,
-    bob_account: User,
-    change: str,
+def test_account_deactivated_between_requests_is_gone_from_the_pages_that_follow(
+    client: TestClient, session: Session, alice_account: User, bob_account: User
 ) -> None:
     posts = add_posts(session, 8, alice_account, bob_account)
     first = feed(client, limit=2).json()
     assert {item["author"]["username"] for item in first["items"]} == {"alice", "bob"}
 
-    if change == "private":
-        alice_account.is_private = True
-    else:
-        alice_account.is_active = False
+    alice_account.is_active = False
     session.flush()
     pages = walk(client, limit=2, cursor=first["next_cursor"])
 
@@ -1053,26 +1024,25 @@ def test_forged_cursor_cannot_reach_a_hidden_post(
         assert response.json() == EMPTY
 
 
-def test_cursor_into_a_private_accounts_own_list_shows_none_of_it_in_the_feed(
+def test_cursor_from_a_users_own_list_is_only_a_point_in_time_in_the_feed(
     alice_client: TestClient,
     bob_client: TestClient,
     session: Session,
     alice_account: User,
     bob_account: User,
 ) -> None:
-    make_private(session, alice_account)
-    add_posts(session, 5, alice_account)
+    alices = add_posts(session, 5, alice_account)
     bobs = add_posts(session, 2, bob_account, start=START - timedelta(days=1))
-    # A genuine cursor into the private list, as its owner received it.
+    # A genuine cursor into alice's list, as she received it.
     cursor = alice_client.get("/users/alice/posts?limit=2").json()["next_cursor"]
     assert cursor is not None
 
     for viewer in (alice_client, bob_client):
         response = feed(viewer, cursor=cursor)
 
-        # It is only a point in time: the public posts older than it.
+        # Every post older than that point, whoever wrote it and whoever asks.
         assert response.status_code == 200
-        assert ids(response.json()["items"]) == ids(bobs)
+        assert ids(response.json()["items"]) == ids([*alices[2:], *bobs])
 
 
 # --- malformed requests --------------------------------------------------
@@ -1335,10 +1305,11 @@ def test_feed_is_filtered_ordered_and_cut_by_the_database(
         "posts.deleted_at IS NULL",
         "users.is_active IS true",
         "users.email_verified_at IS NOT NULL",
-        "users.is_private IS false",
         "(posts.created_at, posts.id) < (",
     ):
         assert condition in sql, condition
+    # Those are all the rules there are: no account is public or private.
+    assert "private" not in sql.lower()
     assert " ORDER BY posts.created_at DESC, posts.id DESC LIMIT " in sql
     assert "OFFSET" not in sql
     # Nothing but posts, their authors and their likes and reposts is

@@ -176,7 +176,7 @@ curl -X POST localhost:8000/auth/verify-email \
 
 | Endpoint | Access | Purpose |
 | --- | --- | --- |
-| `GET /users/me` | authenticated | The caller's own profile, with private account fields |
+| `GET /users/me` | authenticated | The caller's own profile, with the fields only they may see |
 | `PATCH /users/me` | authenticated | Change the caller's own profile |
 | `GET /users/{username}` | public | Anyone's public profile |
 
@@ -184,24 +184,27 @@ A profile is the existing `users` row; there is no separate profile table.
 `followers_count` and `following_count` are counted from `follows` on every
 request and are not stored anywhere.
 
-### Public and private views
+### Public and own views
 
 The two views are separate schemas in `app/schemas/user.py`, each listing its
 fields in full.
 
 - **Public** (`GET /users/{username}`): `id`, `username`, `display_name`, `bio`,
-  `avatar_url`, `is_private`, `followers_count`, `following_count`,
+  `avatar_url`, `followers_count`, `following_count`, `following`,
   `created_at`. The query selects only these columns, so the private ones are
-  never read on this path.
-- **Own** (`GET /users/me`): the same, plus `email` and `email_verified_at`.
+  never read on this path. `following` says whether the caller follows the user
+  (see [Follows](#follows)); it is the one field that depends on who is asking,
+  so the response is sent with `Cache-Control: no-store`.
+- **Own** (`GET /users/me`): the public fields except `following`, plus `email`
+  and `email_verified_at`.
 
 `password_hash`, `is_active` and `updated_at` are in neither.
 
 The username in the path is matched in its canonical lowercase form. Every
 account that is not shown gives the same `404`: one that does not exist, one
-that is deactivated, and one whose email address was never verified. A private
-account's profile is still shown; `is_private` only marks its future content as
-restricted.
+that is deactivated, and one whose email address was never verified. Every
+other account has a profile, and it is the same kind of profile: there is no
+privacy setting, and no field that says anything of the kind.
 
 ### Editing
 
@@ -212,12 +215,11 @@ restricted.
 | `display_name` | 1 to 50 characters after trimming, any script | rejected |
 | `bio` | up to 160 characters of plain text after trimming | clears it |
 | `avatar_url` | an absolute `http(s)` URL | clears it |
-| `is_private` | `true` or `false` | rejected |
 
 A blank `bio` is stored as no bio. A request with none of these fields is
 rejected with `422`. Any other field in the body is ignored, so `username`,
 `email`, `is_active` and the rest cannot be changed here; the service also
-refuses to write any column outside these four.
+refuses to write any column outside these three.
 
 The endpoint takes no user identifier. It always edits the authenticated user,
 so there is no way to address someone else's profile.
@@ -240,8 +242,8 @@ for display is the client's job.
 | `DELETE /posts/{post_id}/repost` | authenticated | Take the repost back |
 | `GET /users/{username}/posts` | public | A user's posts, newest first |
 
-"Public" means no session is needed for a public account's posts. The answer
-still depends on who is asking, so these responses are sent with
+"Public" means no session is needed. Part of the answer still depends on who is
+asking (`liked_by_me`, `reposted_by_me`), so these responses are sent with
 `Cache-Control: no-store`.
 
 A post is text only. A reply is a post whose `parent_post_id` names another
@@ -281,31 +283,29 @@ display is the client's job.
 
 ### Visibility
 
-Who may see a post is decided in one place, `_visible_posts` in
+Which posts are shown is decided in one place, `_visible_posts` in
 `app/services/posts.py`. Every read, and every check that a post exists for
 someone, goes through it.
 
-- A post is visible if it is not deleted, its author's account is shown at all
-  (active and verified, the same rule as for profiles), and the author allows
-  the viewer to read their posts.
-- A **public** account's posts can be read by anyone.
-- A **private** account's posts can be read only by that account. This is
-  temporary: once following exists, approved followers are added to
-  `_posts_readable_by`, and every endpoint picks that up.
+A post is shown if it is not deleted and its author's account is shown at all
+(active and verified, the same rule as for profiles). That is the whole rule,
+and it is the same for every reader, signed in or not. No account keeps its
+posts to itself, and following an account plays no part in reading them (see
+[Follows](#follows)). Who is asking decides only `liked_by_me` and
+`reposted_by_me`.
 
-The account that decides is always the post's own author. A private account's
-reply to a public post is private; a public account's reply stays visible when
-the post it answers is deleted or becomes private.
+The account that decides is always the post's own author. A reply by an account
+that is no longer shown is hidden while the post it answers stays, and a reply
+stays visible when the post it answers is deleted or its author is deactivated.
 
-A post the caller may not see is answered like one that does not exist:
+A post that is not shown is answered like one that does not exist:
 `404 Post not found`, from the same single query. That holds for writes too.
 `PATCH` or `DELETE` on a hidden post is a `404`, never a `403`, so a write
 attempt cannot confirm that an id belongs to a post. `403` is only given for a
 post the caller can read but did not write.
 
 `GET /users/{username}/posts` answers `404 User not found` for the accounts
-whose profile is not shown. For a private account, whose profile is public, it
-answers `403` to everyone but the owner, whether or not the account has posts.
+whose profile is not shown, and the posts of every other account to anyone.
 
 ### Editing
 
@@ -347,13 +347,13 @@ and taking back a like that is not there leaves it not there; both are answered
 with the current state, never with `409`. The same goes for reposts, and a like
 and a repost of the same post are independent of each other.
 
-Only a post the caller can read can be liked or reposted, replies included,
-and a private account's own posts by that account. Any other post, whether
-hidden, deleted or nonexistent, is `404 Post not found`, from the same lookup
-as reading it, so an attempt reveals nothing about a hidden post. That also
-holds for taking back: the likes and reposts of a post that is deleted or
-becomes hidden stay in the database with it, are reported to nobody, and are
-shown again if the post becomes readable again.
+Only a post that is shown can be liked or reposted, replies included, and
+one's own posts like anyone else's. Any other post, whether hidden, deleted or
+nonexistent, is `404 Post not found`, from the same lookup as reading it, so an
+attempt reveals nothing about a hidden post. That also holds for taking back:
+the likes and reposts of a post that is deleted or becomes hidden stay in the
+database with it, are reported to nobody, and are shown again if the post
+becomes readable again.
 
 Every post in every response carries `like_count`, `liked_by_me`,
 `repost_count` and `reposted_by_me`. The counts are the same for every reader.
@@ -413,7 +413,7 @@ The implementation is `app/core/pagination.py` (`paginate`) and the
 | --- | --- |
 | `400` | Malformed `cursor` |
 | `401` | No usable session, on an endpoint that needs one |
-| `403` | Not the author of the post; reading a private account's posts; unverified email; cross-site request |
+| `403` | Not the author of the post; unverified email; cross-site request |
 | `404` | Post, parent post or user not found, or not visible to the caller |
 | `409` | The 60-minute edit window has passed |
 | `422` | Invalid `content`, `parent_post_id`, `post_id` or `limit` |
@@ -422,11 +422,11 @@ The implementation is `app/core/pagination.py` (`paginate`) and the
 
 | Endpoint | Access | Purpose |
 | --- | --- | --- |
-| `GET /feed` | public | For You: the posts of public accounts, newest first |
+| `GET /feed` | public | For You: every post that is shown, newest first |
 
-For You is, for now, deliberately not a recommendation. It is public content in
-chronological order: every post of every public account, newest first. Nothing
-is ranked, and likes, reposts and follows play no part in it.
+For You is, for now, deliberately not a recommendation. It is every post that
+is shown, in chronological order, newest first. Nothing is ranked, and likes,
+reposts and follows play no part in it.
 
 ```
 GET /feed?limit=20
@@ -443,21 +443,17 @@ same errors (see [Pagination](#pagination)). It is sent with
 
 ### What is in it
 
-A post is in the feed if the caller may see it under the
-[visibility rules](#visibility) (not deleted, author active and verified) and
-its author's account is public. The second condition is the feed's own, added
-by `list_for_you_feed` on top of `_visible_posts`:
+A post is in the feed if it is shown under the
+[visibility rules](#visibility): not deleted, author active and verified. The
+feed has no rule of its own; `list_for_you_feed` is `_visible_posts`, paginated.
 
-- A private account's posts are in the feed for nobody, the account itself
-  included. The owner still reads them through `GET /posts/{post_id}` and
-  `GET /users/{username}/posts`.
-- No session is needed, and the answer is currently the same with or without
-  one. The caller is still passed to `_visible_posts`, so a rule added there
-  later applies to the feed without a change here.
+- No session is needed, and the same posts are in the feed with or without
+  one. An author finds their own posts in it like anyone else's.
+- Whom the caller follows changes nothing. This is not a Following feed.
 - Replies are posts. Each appears at its own place in time with its
-  `parent_post_id`; nothing is grouped into conversations. A public account's
-  reply stays in the feed when the post it answers is deleted or becomes
-  private, and only the parent's id is shown, as on every other endpoint.
+  `parent_post_id`; nothing is grouped into conversations. A reply stays in the
+  feed when the post it answers is deleted or its author is deactivated, and
+  only the parent's id is shown, as on every other endpoint.
 
 Posts that are not shown are left out by the query itself, before the page is
 cut. They take up no room on a page, and nothing in a response, `next_cursor`
@@ -474,9 +470,125 @@ backwards from the cursor's position and stops when the page is full, so a deep
 page costs the same as the first one. No index was added for the feed: a
 composite `(created_at, id)` index was measured on 300,000 posts and changed
 nothing, because rows that share a timestamp to the microsecond are rare. What
-the scan cannot skip cheaply is a long run of consecutive posts by private or
-deactivated accounts, since that is decided in `users`; in the same measurement
+the scan cannot skip cheaply is a long run of consecutive posts by accounts
+that are not shown, since that is decided in `users`; in the same measurement
 5,000 such posts in a row cost under 2 ms.
+
+## Follows
+
+| Endpoint | Access | Purpose |
+| --- | --- | --- |
+| `POST /users/{username}/follow` | authenticated | Follow the user |
+| `DELETE /users/{username}/follow` | authenticated | Unfollow the user |
+| `GET /users/{username}/follow-status` | public | Whether the caller follows the user |
+| `GET /users/{username}/followers` | public | The users who follow the user |
+| `GET /users/{username}/following` | public | The users the user follows |
+
+A follow is one row in `follows`: this account follows that one. It takes
+effect at once. There are no follow requests, no approval and no state in
+between, and following goes one way: it says nothing about being followed
+back.
+
+Hopsnop has no public and private accounts. There is no privacy setting, so
+every account that is shown can be followed by any other, and anyone can read
+its lists. Following is, for now, also independent of everything about posts:
+it changes neither which posts can be read nor what is in the For You feed.
+
+### Following and unfollowing
+
+Both need a session of an active account with a verified email address (`401`
+without a session, `403` for an unverified address), and both answer `200` with
+the resulting state:
+
+```json
+{"following": true}
+```
+
+Who follows is always the signed-in user. The requests take no body, and
+nothing in a request can name another follower.
+
+A request can be repeated. Following a user who is already followed leaves
+them followed, and unfollowing a user who is not followed leaves them not
+followed; both are answered with the current state, never with `409`.
+
+Following yourself is `400 You cannot follow yourself`. The service refuses it
+before the database is asked; the check constraint `ck_follows_no_self_follow`
+remains as the last line. Unfollowing yourself is simply `{"following": false}`.
+
+Only an account that is shown can be followed: active, with a verified email
+address, the same rule as for profiles. Any other name is `404 User not found`,
+whatever the reason, for every endpoint here. A follow of an account that later
+stops being shown stays in the table, is listed for nobody, and can be ended
+once the account is shown again.
+
+### Follow state and counts
+
+`GET /users/{username}/follow-status` answers `{"following": true}` or
+`{"following": false}`. It needs no session; an anonymous caller follows
+nobody, so the answer is then `false`. The same value is the `following` field
+of the user's public profile.
+
+It is always the caller's own follow. Who else follows a user is only in the
+lists below.
+
+`followers_count` and `following_count` on a profile are counted from the rows
+by the statement that reads the profile, together with `following`. They are
+row counts: a follow by an account that is no longer shown is still counted,
+although that account is on no list.
+
+### Lists
+
+```
+GET /users/alice/followers?limit=20
+{
+  "items": [{"username": "bob", "display_name": "Bob", "avatar_url": null}],
+  "next_cursor": null
+}
+```
+
+`followers` and `following` need no session and are the same for every reader.
+An item holds what a list shows and what links to the profile: `username`,
+`display_name`, `avatar_url`. There is no id in it.
+
+Only accounts that are shown are listed. They are left out by the query, before
+the page is cut, so a list reveals no account that `GET /users/{username}`
+hides, and `next_cursor` does not either.
+
+The most recent follow comes first. A follow has no id of its own, so follows
+made at the same instant are ordered by the id of the listed account, which is
+unique within one list. Paging is the cursor pagination of the other lists
+(see [Pagination](#pagination)): the same `limit`, the same cursor format, the
+same `400` for a value that is not a cursor. `paginate` takes the name of the
+tie-breaking column for this.
+
+The cursor of these lists holds the time of the last follow on the page and the
+id of that account. The id is public through the profile; the time is not shown
+anywhere else, so each page gives away when its last follow was made.
+
+A page is one statement for the follows and the users on it, after one that
+finds the account.
+
+### Indexes
+
+No index was added. The primary key `(follower_id, following_id)` answers "does
+A follow B", "whom does A follow" and the following count; the existing
+`ix_follows_following_id_follower_id` answers "who follows B" and the follower
+count.
+
+Neither is ordered by time, so a page of a list sorts all of that account's
+follows first. Measured on 4.1 million follows, that is under half a
+millisecond for an account with 20 followers and 15 to 19 ms for one with
+100,000, the same as counting them for its profile. An index on
+`(following_id, created_at DESC, follower_id DESC)`, and its twin for the other
+direction, brings the page to under a millisecond and is the change to make if
+accounts of that size appear.
+
+### Concurrency
+
+A second follow of the same account by the same user is ruled out by the
+primary key. Requests insert with `ON CONFLICT DO NOTHING` instead of checking
+first, so two identical requests arriving at once cannot both insert and
+neither fails.
 
 ## Tests
 

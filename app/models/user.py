@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, String, false, func, true
+from sqlalchemy import CheckConstraint, String, func, true
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -37,7 +37,6 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(50))
     bio: Mapped[str | None] = mapped_column(String(160))
     avatar_url: Mapped[str | None] = mapped_column(String)
-    is_private: Mapped[bool] = mapped_column(server_default=false())
     is_active: Mapped[bool] = mapped_column(server_default=true())
     # NULL until the address has been confirmed through an emailed token; then
     # the moment it was confirmed.

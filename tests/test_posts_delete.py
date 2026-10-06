@@ -113,16 +113,6 @@ def test_post_of_any_age_can_be_deleted(
     assert post_columns(session, old.id)["deleted_at"] is not None
 
 
-def test_owner_of_a_private_account_can_delete_their_post(
-    alice_client: TestClient, session: Session, alice_account: User
-) -> None:
-    alice_account.is_private = True
-    session.flush()
-    post = create(alice_client)
-
-    assert delete(alice_client, post["id"]).status_code == 204
-
-
 def test_delete_ignores_a_request_body(
     alice_client: TestClient, session: Session, bob_account: User, clock
 ) -> None:

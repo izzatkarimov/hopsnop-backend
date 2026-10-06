@@ -18,8 +18,8 @@ from app.core.pagination import (
     encode_cursor,
     paginate,
 )
-from app.models import Post, User
-from helpers import add_post
+from app.models import Follow, Post, User
+from helpers import add_post, add_user
 
 MOMENT = datetime(2026, 10, 5, 12, 30, 45, 123456, tzinfo=timezone.utc)
 
@@ -281,3 +281,85 @@ def test_cursor_beyond_the_last_row_gives_an_empty_page(
 
     assert list(page.items) == []
     assert page.next_cursor is None
+
+
+# --- rows without an id of their own -------------------------------------
+
+
+def followers_at(session: Session, followed: User, times: list[datetime]) -> list:
+    """One new follower of ``followed`` per time, as (time, id of the follower)."""
+    followers = []
+    for number, time in enumerate(times):
+        follower = add_user(session, f"follower{number:02d}")
+        session.add(
+            Follow(follower_id=follower.id, following_id=followed.id, created_at=time)
+        )
+        followers.append((time, follower.id))
+    session.flush()
+    return followers
+
+
+def walk_follows(session: Session, followed: User, limit: int) -> list:
+    statement = select(Follow).where(Follow.following_id == followed.id)
+    seen, after = [], None
+    while True:
+        page = paginate(
+            session,
+            statement,
+            Follow,
+            limit=limit,
+            after=after,
+            tiebreaker="follower_id",
+        )
+        seen += [(follow.created_at, follow.follower_id) for follow in page.items]
+        if page.next_cursor is None:
+            return seen
+        after = decode_cursor(page.next_cursor)
+
+
+def test_named_column_takes_the_place_of_the_id(session: Session, alice: User) -> None:
+    # A follow has no id. Among the followers of one user, the follower does.
+    times = [MOMENT + timedelta(minutes=number) for number in range(5)]
+    followers = followers_at(session, alice, times)
+    statement = select(Follow).where(Follow.following_id == alice.id)
+
+    first = paginate(session, statement, Follow, limit=2, tiebreaker="follower_id")
+    second = paginate(
+        session,
+        statement,
+        Follow,
+        limit=2,
+        after=decode_cursor(first.next_cursor),
+        tiebreaker="follower_id",
+    )
+
+    newest_first = followers[::-1]
+    assert [follow.follower_id for follow in first.items] == [
+        id for _, id in newest_first[:2]
+    ]
+    assert [follow.follower_id for follow in second.items] == [
+        id for _, id in newest_first[2:4]
+    ]
+    # The cursor is the same kind of cursor: a time, and that column as its id.
+    time, follower_id = newest_first[1]
+    assert decode_cursor(first.next_cursor) == Cursor(created_at=time, id=follower_id)
+
+
+def test_named_column_orders_rows_created_at_the_same_instant(
+    session: Session, alice: User
+) -> None:
+    followers = followers_at(session, alice, [MOMENT] * 9)
+
+    for limit in (1, 2, 4, 9, 10):
+        # Every row exactly once, although no timestamp tells them apart.
+        assert walk_follows(session, alice, limit) == sorted(followers, reverse=True)
+
+
+def test_naming_the_id_changes_nothing(session: Session, alice: User) -> None:
+    posts_at_distinct_times(session, alice, 5)
+
+    default = paginate(session, select(Post), Post, limit=3)
+    named = paginate(session, select(Post), Post, limit=3, tiebreaker="id")
+
+    assert list(named.items) == list(default.items)
+    assert named.next_cursor == default.next_cursor

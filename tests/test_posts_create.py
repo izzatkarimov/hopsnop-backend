@@ -124,15 +124,6 @@ def test_post_responses_are_not_to_be_cached(alice_client: TestClient) -> None:
     assert create(alice_client).headers["cache-control"] == "no-store"
 
 
-def test_private_account_can_post(
-    alice_client: TestClient, session: Session, alice_account: User
-) -> None:
-    alice_account.is_private = True
-    session.flush()
-
-    assert create(alice_client).status_code == 201
-
-
 # --- who may create a post -----------------------------------------------
 
 
@@ -535,7 +526,6 @@ def test_client_cannot_set_the_fields_the_server_controls(
         deleted_at=long_ago,
         is_reply=True,
         editable_until="2099-01-01T00:00:00Z",
-        is_private=False,
     )
 
     assert response.status_code == 201

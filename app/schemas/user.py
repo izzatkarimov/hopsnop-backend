@@ -16,7 +16,6 @@ from pydantic import (
     ConfigDict,
     Field,
     HttpUrl,
-    StrictBool,
     StringConstraints,
     TypeAdapter,
     ValidationError,
@@ -75,7 +74,7 @@ class UpdateProfileRequest(BaseModel):
     Only the fields that are sent are changed; a field that is left out keeps
     its value. Sending ``null`` for ``bio`` or ``avatar_url`` clears it.
 
-    These four fields are the only ones a user can change here. Anything else
+    These three fields are the only ones a user can change here. Anything else
     in the body is ignored, like everywhere else in the API.
     """
 
@@ -93,15 +92,11 @@ class UpdateProfileRequest(BaseModel):
         default=None,
         description="An absolute http(s) URL. null clears it.",
     )
-    is_private: StrictBool | None = Field(
-        default=None,
-        description="true or false. Cannot be null.",
-    )
 
-    @field_validator("display_name", "is_private")
+    @field_validator("display_name")
     @classmethod
     def _not_null(cls, value: object) -> object:
-        # These columns are NOT NULL: they can be changed but not cleared.
+        # This column is NOT NULL: it can be changed but not cleared.
         if value is None:
             raise ValueError("This field cannot be null.")
         return value
@@ -110,12 +105,11 @@ class UpdateProfileRequest(BaseModel):
     def _has_changes(self) -> Self:
         if not self.model_fields_set:
             raise ValueError(
-                "At least one of display_name, bio, avatar_url or is_private "
-                "must be provided."
+                "At least one of display_name, bio or avatar_url must be provided."
             )
         return self
 
-    def changes(self) -> dict[str, str | bool | None]:
+    def changes(self) -> dict[str, str | None]:
         """The fields that were sent, and only those, as plain values."""
         return self.model_dump(exclude_unset=True, mode="json")
 
@@ -133,10 +127,45 @@ class PublicProfileResponse(BaseModel):
     display_name: str
     bio: str | None
     avatar_url: str | None
-    is_private: bool
     followers_count: int
     following_count: int
+    # Whether the caller follows this user. Always false for an anonymous
+    # request. It is the caller's own follow and nobody else's: who else
+    # follows the user is not part of a profile.
+    following: bool
     created_at: datetime
+
+
+class FollowResponse(BaseModel):
+    """Whether the caller follows a user."""
+
+    following: bool
+
+
+class UserSummaryResponse(BaseModel):
+    """What a list of users shows of each.
+
+    Enough to render a row and to link to the profile, which is addressed by
+    the username. No id is needed for that, so there is none.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    username: str
+    display_name: str
+    avatar_url: str | None
+
+
+class UserPageResponse(BaseModel):
+    """One page of a list of users."""
+
+    items: list[UserSummaryResponse]
+    next_cursor: str | None = Field(
+        description=(
+            "Pass as `cursor` to get the next page. null when there are no "
+            "more users."
+        ),
+    )
 
 
 class MyProfileResponse(BaseModel):
@@ -152,7 +181,6 @@ class MyProfileResponse(BaseModel):
     display_name: str
     bio: str | None
     avatar_url: str | None
-    is_private: bool
     email_verified_at: datetime | None
     followers_count: int
     following_count: int

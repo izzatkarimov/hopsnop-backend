@@ -78,20 +78,12 @@ def all_posts(session: Session) -> dict[uuid.UUID, dict[str, object]]:
     }
 
 
-def make_private(session: Session, user: User) -> None:
-    user.is_private = True
-    session.flush()
-
-
 def add_hidden_posts(session: Session, *, start: datetime = START) -> list[Post]:
     """One post for each reason a post is kept out of the feed.
 
     Their text starts with "Hidden" and their authors are named "hidden_...".
     """
-    private = add_user(session, "hidden_private")
-    make_private(session, private)
     authors = {
-        "private": private,
         "inactive": add_user(session, "hidden_inactive", active=False),
         "unverified": add_user(session, "hidden_unverified", verified=False),
         "deleted": add_user(session, "hidden_deleted"),
@@ -170,14 +162,14 @@ def test_feed_can_only_be_read(
         "private=1&is_private=true",
         "all=1&visibility=all",
         "is_active=false&verified=false",
-        "author=hidden_private&username=hidden_private",
+        "author=hidden_inactive&username=hidden_inactive",
         "filter=none&scope=everything",
     ],
 )
 def test_no_parameter_widens_the_feed(
     alice_client: TestClient, session: Session, alice_account: User, query: str
 ) -> None:
-    add_post(session, alice_account, "Public")
+    add_post(session, alice_account, "Shown")
     add_hidden_posts(session)
 
     plain = alice_client.get("/feed")
@@ -198,13 +190,14 @@ def test_hidden_posts_leave_no_trace_in_any_response(
     for number in range(4):
         author = (alice_account, bob_account)[number % 2]
         at = START + number * MINUTE
-        add_post(session, author, f"Public {number}", created_at=at)
+        add_post(session, author, f"Shown {number}", created_at=at)
     hidden = add_hidden_posts(session)
-    bob, private_owner = make_client(), make_client()
+    # The author of a hidden post is shown it no more than anyone else.
+    bob, its_author = make_client(), make_client()
     log_in(bob, "bob")
-    log_in(private_owner, "hidden_private")
+    assert log_in(its_author, "hidden_deleted").status_code == 200
 
-    for viewer in (make_client(), bob, private_owner):
+    for viewer in (make_client(), bob, its_author):
         for limit in (1, 3, 50):
             responses = walk(viewer, limit=limit)
             assert sum(len(response.json()["items"]) for response in responses) == 4
@@ -222,10 +215,10 @@ def test_feed_is_the_same_with_and_without_hidden_posts(
 ) -> None:
     for number in range(4):
         at = START + number * MINUTE
-        add_post(session, alice_account, f"Public {number}", created_at=at)
+        add_post(session, alice_account, f"Shown {number}", created_at=at)
     without = walk(client, limit=2)
 
-    # Hidden posts between the public ones, and more of them after the last.
+    # Hidden posts between the shown ones, and more of them after the last.
     add_hidden_posts(session)
     for number in range(3):
         add_post(
@@ -245,17 +238,15 @@ def test_feed_is_the_same_with_and_without_hidden_posts(
         assert dict(after.headers) == dict(before.headers)
 
 
-def test_private_account_is_not_shown_its_own_posts_or_those_of_another(
+def test_author_is_not_shown_their_own_deleted_posts_or_those_of_another(
     make_client, session: Session
 ) -> None:
-    first = add_user(session, "first_private")
-    second = add_user(session, "second_private")
-    make_private(session, first)
-    make_private(session, second)
-    add_post(session, first, "Hidden: first")
-    add_post(session, second, "Hidden: second")
+    first = add_user(session, "first_author")
+    second = add_user(session, "second_author")
+    add_post(session, first, "Hidden: first", deleted=True)
+    add_post(session, second, "Hidden: second", deleted=True)
     viewer = make_client()
-    log_in(viewer, "first_private")
+    log_in(viewer, "first_author")
 
     response = viewer.get("/feed")
 

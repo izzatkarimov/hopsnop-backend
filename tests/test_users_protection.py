@@ -22,7 +22,7 @@ from app.schemas.user import (
 from app.services import users as users_service
 from helpers import SENSITIVE_KEYS, add_user, columns, keys_in, log_in
 
-EDITABLE = {"display_name", "bio", "avatar_url", "is_private"}
+EDITABLE = {"display_name", "bio", "avatar_url"}
 PRIVATE_ONLY = {"email", "email_verified_at"}
 NEVER_EXPOSED = {"password_hash", "is_active", "updated_at"}
 
@@ -198,12 +198,12 @@ def test_each_user_updates_their_own_profile(
     log_in(bob, "bob")
 
     patch(alice, bio="Alice's bio")
-    patch(bob, bio="Bob's bio", is_private=True)
+    patch(bob, bio="Bob's bio", display_name="Robert")
 
     assert columns(session, alice_account)["bio"] == "Alice's bio"
-    assert columns(session, alice_account)["is_private"] is False
+    assert columns(session, alice_account)["display_name"] == "Alice"
     assert columns(session, bob_account)["bio"] == "Bob's bio"
-    assert columns(session, bob_account)["is_private"] is True
+    assert columns(session, bob_account)["display_name"] == "Robert"
 
 
 def test_the_only_user_routes_are_the_intended_ones() -> None:
@@ -220,6 +220,11 @@ def test_the_only_user_routes_are_the_intended_ones() -> None:
         ("GET", "/users/{username}"),
         # Read-only, and the only route that reaches a user's posts.
         ("GET", "/users/{username}/posts"),
+        ("POST", "/users/{username}/follow"),
+        ("DELETE", "/users/{username}/follow"),
+        ("GET", "/users/{username}/follow-status"),
+        ("GET", "/users/{username}/followers"),
+        ("GET", "/users/{username}/following"),
     }
 
 
@@ -271,7 +276,7 @@ def test_cross_site_update_is_rejected_and_has_no_effect(
 
     response = alice_client.patch(
         "/users/me",
-        json={"is_private": True},
+        json={"bio": "Changed"},
         headers={"Origin": "https://evil.example"},
     )
 

@@ -10,14 +10,18 @@ never skips one.
 The order is ``created_at`` descending, then ``id`` descending. The id only
 breaks ties between rows created at the same instant, which makes the order
 total; without it, rows with equal timestamps could change places between two
-requests.
+requests. A list of rows that have no id of their own names another unique
+column for that.
 
 The cursor handed to clients encodes exactly those two values of the last row
 on the page. It is opaque by contract, but it is not secret and it is not
-signed, and it does not need to be: both values are already in the page the
-client was given, and a cursor only selects a position. What a query may
-return is decided by the query's own conditions, which apply to every page
-whatever cursor comes with the request.
+signed, and it does not need to be: a cursor only selects a position. What a
+query may return is decided by the query's own conditions, which apply to
+every page whatever cursor comes with the request.
+
+Not being secret also means that whoever is given a cursor can read the two
+values in it. For a list of posts both are in the page itself. A list ordered
+by anything its items do not show gives that much away with each page.
 """
 
 import base64
@@ -87,9 +91,12 @@ def decode_cursor(value: str) -> Cursor:
 
 
 class _Ordered(Protocol):
-    """A model that can be paginated: it has the two ordering columns."""
+    """A model that can be paginated: its rows have a time to be ordered by.
 
-    id: Mapped[uuid.UUID]
+    The second ordering column is its ``id``, or for a model that has none
+    the column named by ``paginate``'s ``tiebreaker``.
+    """
+
     created_at: Mapped[datetime]
 
 
@@ -110,20 +117,27 @@ def paginate(
     *,
     limit: int,
     after: Cursor | None = None,
+    tiebreaker: str = "id",
 ) -> Page[_Row]:
     """One page of ``statement``'s rows of ``model``, newest first.
 
     ``statement`` selects and filters; the order, the starting position and
     the size are applied here. ``after`` is the cursor of the previous page,
     or None for the first page.
+
+    ``tiebreaker`` names the column of ``model`` that orders rows created at
+    the same instant, and it is what the cursor carries as its id. It has to
+    be a UUID that no two rows of ``statement`` share. For most models that
+    is the ``id``; a model without one names another column.
     """
+    created_at, unique = model.created_at, getattr(model, tiebreaker)
     if after is not None:
         # A row comparison: strictly after the cursor's row in the order.
         statement = statement.where(
-            tuple_(model.created_at, model.id) < (after.created_at, after.id)
+            tuple_(created_at, unique) < (after.created_at, after.id)
         )
     rows = db.scalars(
-        statement.order_by(model.created_at.desc(), model.id.desc())
+        statement.order_by(created_at.desc(), unique.desc())
         # One row more than asked for, only to learn whether a next page
         # exists. It is not returned.
         .limit(limit + 1)
@@ -132,7 +146,12 @@ def paginate(
     items = rows[:limit]
     has_more = len(rows) > limit
     next_cursor = (
-        encode_cursor(Cursor(created_at=items[-1].created_at, id=items[-1].id))
+        encode_cursor(
+            Cursor(
+                created_at=items[-1].created_at,
+                id=getattr(items[-1], tiebreaker),
+            )
+        )
         if has_more
         else None
     )

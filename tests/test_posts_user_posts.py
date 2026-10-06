@@ -19,7 +19,7 @@ from app.core.pagination import (
     encode_cursor,
 )
 from app.main import app
-from app.models import Post, User
+from app.models import Like, Post, User
 from helpers import (
     SENSITIVE_KEYS,
     add_post,
@@ -45,7 +45,6 @@ POST_FIELDS = {
     "reposted_by_me",
 }
 USER_NOT_FOUND = {"detail": "User not found."}
-PRIVATE = {"detail": "This account's posts are private."}
 INVALID_CURSOR = {"detail": "Invalid cursor."}
 START = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 # Well formed in every respect, but its time lies beyond the year 9999.
@@ -97,11 +96,6 @@ def walk(
         if cursor is None:
             return pages
         assert len(pages) < 200, "pagination does not terminate"
-
-
-def make_private(session: Session, user: User) -> None:
-    user.is_private = True
-    session.flush()
 
 
 # --- a user's posts ------------------------------------------------------
@@ -256,7 +250,7 @@ def test_user_posts_responses_are_not_to_be_cached(
 # --- who may read them ---------------------------------------------------
 
 
-def test_public_users_posts_need_no_authentication(
+def test_users_posts_need_no_authentication(
     client: TestClient, session: Session, alice_account: User
 ) -> None:
     add_posts(session, alice_account, 2)
@@ -265,7 +259,7 @@ def test_public_users_posts_need_no_authentication(
     assert page(client).status_code == 200
 
 
-def test_public_users_posts_are_the_same_for_every_viewer(
+def test_users_posts_are_the_same_for_every_viewer(
     make_client, session: Session, alice_account: User, bob_account: User
 ) -> None:
     add_posts(session, alice_account, 3)
@@ -279,121 +273,84 @@ def test_public_users_posts_are_the_same_for_every_viewer(
     assert len(seen[0]["items"]) == 3
 
 
-def test_private_accounts_posts_are_refused_without_authentication(
-    client: TestClient, session: Session, alice_account: User
+def test_reading_a_users_posts_is_never_forbidden(
+    make_client, session: Session, alice_account: User, bob_account: User
 ) -> None:
-    make_private(session, alice_account)
-    add_post(session, alice_account, "For my eyes only")
-
-    response = page(client)
-
-    assert response.status_code == 403
-    assert response.json() == PRIVATE
-    assert "For my eyes only" not in response.text
-
-
-def test_private_accounts_posts_are_refused_to_another_user(
-    bob_client: TestClient, session: Session, alice_account: User
-) -> None:
-    make_private(session, alice_account)
-    add_post(session, alice_account, "For my eyes only")
-
-    response = page(bob_client)
-
-    assert response.status_code == 403
-    assert response.json() == PRIVATE
-    assert "For my eyes only" not in response.text
-
-
-def test_owner_of_a_private_account_gets_their_own_posts(
-    alice_client: TestClient, session: Session, alice_account: User
-) -> None:
-    make_private(session, alice_account)
     posts = add_posts(session, alice_account, 3)
+    follow(session, bob_account, alice_account)
+    carol = add_user(session, "carol")
+    anonymous, follower, stranger, owner = (make_client() for _ in range(4))
+    for viewer, name in ((follower, "bob"), (stranger, carol.username)):
+        log_in(viewer, name)
+    log_in(owner, "alice")
 
-    response = page(alice_client)
+    # No account keeps its posts to itself, so nobody is ever refused them.
+    for viewer in (anonymous, follower, stranger, owner):
+        response = page(viewer)
+        assert response.status_code == 200
+        assert ids(response.json()["items"]) == ids(posts)
+        assert "private" not in response.text
 
-    assert response.status_code == 200
-    assert ids(response.json()["items"]) == ids(posts)
 
-
-def test_following_a_private_account_does_not_open_its_posts_yet(
+def test_following_plays_no_part_in_reading_a_users_posts(
     bob_client: TestClient, session: Session, alice_account: User, bob_account: User
 ) -> None:
-    make_private(session, alice_account)
-    add_post(session, alice_account)
+    add_posts(session, alice_account, 3)
+    before = page(bob_client).json()
+
     follow(session, bob_account, alice_account)
 
-    assert page(bob_client).status_code == 403
+    assert page(bob_client).json() == before
+    assert len(before["items"]) == 3
 
 
-def test_refusal_does_not_reveal_whether_the_private_account_has_posts(
-    bob_client: TestClient, session: Session, alice_account: User
-) -> None:
-    make_private(session, alice_account)
-    without_posts = page(bob_client)
-
-    add_posts(session, alice_account, 5)
-    add_post(session, alice_account, deleted=True)
-    with_posts = page(bob_client)
-
-    assert without_posts.status_code == with_posts.status_code == 403
-    assert without_posts.text == with_posts.text
-    assert sorted(without_posts.headers) == sorted(with_posts.headers)
-
-
-def test_private_accounts_profile_stays_visible_while_its_posts_do_not(
-    client: TestClient, session: Session, alice_account: User
-) -> None:
-    # Phase 3 behaviour, unchanged: the profile says the account is private.
-    make_private(session, alice_account)
-    add_post(session, alice_account)
-
-    profile = client.get("/users/alice")
-
-    assert profile.status_code == 200
-    assert profile.json()["is_private"] is True
-    assert page(client).status_code == 403
-
-
-def test_posts_open_up_and_close_with_the_privacy_setting(
+def test_no_profile_change_closes_a_users_posts(
     alice_client: TestClient, make_client, session: Session, alice_account: User
 ) -> None:
-    add_posts(session, alice_account, 2)
+    posts = add_posts(session, alice_account, 2)
     anonymous = make_client()
+    before = page(anonymous).json()
+
+    # There is no privacy setting to switch on, alone or next to a real change.
+    alone = alice_client.patch("/users/me", json={"is_private": True})
+    beside = alice_client.patch("/users/me", json={"is_private": True, "bio": "Hi"})
+
     assert page(anonymous).status_code == 200
-
-    alice_client.patch("/users/me", json={"is_private": True})
-    assert page(anonymous).status_code == 403
-    assert len(page(alice_client).json()["items"]) == 2
-
-    alice_client.patch("/users/me", json={"is_private": False})
-    assert len(page(anonymous).json()["items"]) == 2
+    assert page(anonymous).json() == before
+    assert ids(before["items"]) == ids(posts)
+    assert (alone.status_code, beside.status_code) == (422, 200)
 
 
 def test_stale_cookie_is_answered_as_anonymous(
-    client: TestClient, session: Session, alice_account: User, bob_account: User
+    client: TestClient, make_client, session: Session, alice_account: User
 ) -> None:
     add_posts(session, alice_account, 2)
-    make_private(session, bob_account)
+    expected = page(make_client()).json()
     plant_session_cookie(client, "left-over-from-an-old-login")
 
-    assert page(client, "alice").status_code == 200
-    assert page(client, "bob").status_code == 403
+    response = page(client)
+
+    # Not refused: the posts stay readable, as they are for anyone.
+    assert response.status_code == 200
+    assert response.json() == expected
 
 
 def test_viewer_cannot_be_named_by_the_request(
     bob_client: TestClient, session: Session, alice_account: User
 ) -> None:
-    make_private(session, alice_account)
-    add_post(session, alice_account)
+    post = add_post(session, alice_account)
+    session.add(Like(user_id=alice_account.id, post_id=post.id))
+    session.flush()
 
     response = bob_client.get(
         f"/users/alice/posts?viewer_id={alice_account.id}&user_id={alice_account.id}"
-        "&as=alice&is_private=false"
+        "&as=alice"
     )
 
-    assert response.status_code == 403
+    # Whose "by me" it is, is decided by the session and by nothing else.
+    [item] = response.json()["items"]
+    assert item["like_count"] == 1
+    assert item["liked_by_me"] is False
 
 
 # --- accounts that are not found -----------------------------------------
@@ -482,13 +439,12 @@ def test_hidden_account_looks_the_same_as_one_that_does_not_exist(
     client: TestClient, session: Session
 ) -> None:
     inactive = add_user(session, "inactive", active=False)
-    inactive.is_private = True
     add_post(session, inactive)
     add_post(session, add_user(session, "unverified", verified=False))
 
     responses = [
         page(client, "nonexistent"),
-        page(client, "inactive"),  # not "private": that would confirm it exists
+        page(client, "inactive"),
         page(client, "unverified"),
     ]
 
@@ -658,10 +614,9 @@ def test_cursor_is_an_opaque_position_and_nothing_more(
     )
 
 
-def test_paging_works_for_the_owner_of_a_private_account(
+def test_paging_works_the_same_for_the_owner(
     alice_client: TestClient, session: Session, alice_account: User
 ) -> None:
-    make_private(session, alice_account)
     posts = add_posts(session, alice_account, 5)
 
     seen = [id for items in walk(alice_client, limit=2) for id in ids(items)]
@@ -672,33 +627,42 @@ def test_paging_works_for_the_owner_of_a_private_account(
 # --- a cursor is not a key -----------------------------------------------
 
 
-def test_cursor_does_not_open_a_private_accounts_posts(
+def test_cursor_gives_whoever_holds_it_the_same_page(
     alice_client: TestClient,
     bob_client: TestClient,
+    make_client,
     session: Session,
     alice_account: User,
 ) -> None:
-    make_private(session, alice_account)
-    add_posts(session, alice_account, 5)
-    # A genuine cursor into the private list, as its owner received it.
+    posts = add_posts(session, alice_account, 5)
+    # A genuine cursor, as the owner of the posts received it.
     cursor = page(alice_client, limit=2).json()["next_cursor"]
 
-    response = page(bob_client, limit=2, cursor=cursor)
+    answers = [
+        page(viewer, limit=2, cursor=cursor)
+        for viewer in (alice_client, bob_client, make_client())
+    ]
 
-    assert response.status_code == 403
-    assert response.json() == PRIVATE
+    # It is a position in the list, the same for everyone, and no more.
+    for response in answers:
+        assert response.status_code == 200
+        assert ids(response.json()["items"]) == ids(posts[2:4])
 
 
-def test_cursor_obtained_while_public_stops_working_once_the_account_is_private(
-    alice_client: TestClient, make_client, session: Session, alice_account: User
+def test_cursor_stops_working_once_the_account_is_no_longer_shown(
+    make_client, session: Session, alice_account: User
 ) -> None:
     add_posts(session, alice_account, 5)
     anonymous = make_client()
     cursor = page(anonymous, limit=2).json()["next_cursor"]
 
-    alice_client.patch("/users/me", json={"is_private": True})
+    alice_account.is_active = False
+    session.flush()
 
-    assert page(anonymous, limit=2, cursor=cursor).status_code == 403
+    response = page(anonymous, limit=2, cursor=cursor)
+
+    assert response.status_code == 404
+    assert response.json() == USER_NOT_FOUND
 
 
 def test_cursor_from_one_users_list_shows_nothing_of_that_user_elsewhere(
@@ -779,10 +743,8 @@ def test_rejected_cursor_is_not_echoed(client: TestClient, alice_account: User) 
 
 
 def test_malformed_cursor_is_rejected_before_the_account_is_looked_at(
-    bob_client: TestClient, session: Session, alice_account: User
+    bob_client: TestClient, alice_account: User
 ) -> None:
-    make_private(session, alice_account)
-
     # The same answer for every account, so it says nothing about any.
     answers = [
         page(bob_client, name, cursor="abc") for name in ("alice", "nonexistent")
