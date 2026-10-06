@@ -22,6 +22,7 @@ from app.core.config import settings
 from app.db.session import engine
 from app.main import app
 from app.models import Post, Story, User
+from app.services import posts as posts_service
 from app.services.email import get_email_sender
 from helpers import add_user, log_in
 
@@ -166,3 +167,35 @@ def alice_client(client: TestClient, alice_account: User) -> TestClient:
     """A client that is logged in as alice."""
     assert log_in(client, "alice").status_code == 200
     return client
+
+
+@pytest.fixture
+def bob_client(make_client: Callable[..., TestClient], bob_account: User) -> TestClient:
+    """A second browser, logged in as bob."""
+    client = make_client()
+    assert log_in(client, "bob").status_code == 200
+    return client
+
+
+# --- posts ---------------------------------------------------------------
+
+
+class Clock:
+    """Stands in for the posts service's clock. It only moves when told to."""
+
+    def __init__(self) -> None:
+        self.now = datetime.now(timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **duration: float) -> None:
+        self.now += timedelta(**duration)
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
+    """Puts the time that the post rules see under the test's control."""
+    clock = Clock()
+    monkeypatch.setattr(posts_service, "_now", clock)
+    return clock

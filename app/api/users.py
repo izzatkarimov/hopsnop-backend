@@ -2,17 +2,22 @@
 
 Like the authentication handlers these are thin: validation is in
 ``app.schemas.user`` and the rules and queries are in ``app.services.users``.
+
+The list of a user's posts is here as well, because of its path. Its rules
+are in ``app.services.posts`` with those of the other post endpoints.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.api.deps import CurrentUser, DbSession, no_store
+from app.api.deps import CurrentUser, DbSession, OptionalUser, Pagination, no_store
+from app.schemas.post import PostPageResponse, PostResponse
 from app.schemas.user import (
     MyProfileResponse,
     PublicProfileResponse,
     UpdateProfileRequest,
     canonical_username,
 )
+from app.services import posts as posts_service
 from app.services import users as users_service
 from app.services.users import OwnProfile
 
@@ -84,3 +89,39 @@ def get_profile(username: str, db: DbSession) -> PublicProfileResponse:
             detail="User not found.",
         )
     return PublicProfileResponse.model_validate(profile)
+
+
+@router.get(
+    "/{username}/posts",
+    response_model=PostPageResponse,
+    # The answer depends on who is asking, and a post in it can be deleted at
+    # any moment.
+    dependencies=[Depends(no_store)],
+)
+def list_user_posts(
+    username: str,
+    viewer: OptionalUser,
+    page: Pagination,
+    db: DbSession,
+) -> PostPageResponse:
+    """A user's posts, newest first, replies included.
+
+    No authentication is needed for a public account. The posts of a private
+    account are only returned to that account.
+    """
+    canonical = canonical_username(username)
+    if canonical is None:
+        # No account can have this name; the same answer as for one that
+        # does not exist.
+        raise posts_service.UserNotFoundError
+    posts = posts_service.list_user_posts(
+        db,
+        canonical,
+        viewer,
+        limit=page.limit,
+        after=page.after,
+    )
+    return PostPageResponse(
+        items=[PostResponse.model_validate(post) for post in posts.items],
+        next_cursor=posts.next_cursor,
+    )

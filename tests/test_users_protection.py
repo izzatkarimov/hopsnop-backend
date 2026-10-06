@@ -206,7 +206,7 @@ def test_each_user_updates_their_own_profile(
     assert columns(session, bob_account)["is_private"] is True
 
 
-def test_the_only_profile_routes_are_the_three_intended_ones() -> None:
+def test_the_only_user_routes_are_the_intended_ones() -> None:
     routes = {
         (method.upper(), path)
         for path, operations in app.openapi()["paths"].items()
@@ -218,6 +218,8 @@ def test_the_only_profile_routes_are_the_three_intended_ones() -> None:
         ("GET", "/users/me"),
         ("PATCH", "/users/me"),
         ("GET", "/users/{username}"),
+        # Read-only, and the only route that reaches a user's posts.
+        ("GET", "/users/{username}/posts"),
     }
 
 

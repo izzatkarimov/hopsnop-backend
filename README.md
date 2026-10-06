@@ -30,6 +30,9 @@ Deletion rules:
 
 - Posts and stories block deletion of their author (`ON DELETE RESTRICT`).
   Accounts are deactivated through `users.is_active`, not deleted.
+- Posts are deleted by setting `posts.deleted_at`; the row stays. A reply
+  blocks removal of the row it replies to (`ON DELETE RESTRICT` on
+  `posts.parent_post_id`), so a reply never loses its parent.
 - Likes, reposts, follows and story views are removed together with the user,
   post or story they refer to (`ON DELETE CASCADE`).
 - Sessions and email verification / password reset tokens are removed together
@@ -222,6 +225,143 @@ so there is no way to address someone else's profile.
 `avatar_url` is checked for its form only. The server never requests it.
 Profile text is stored and returned exactly as written, as JSON; escaping it
 for display is the client's job.
+
+## Posts
+
+| Endpoint | Access | Purpose |
+| --- | --- | --- |
+| `POST /posts` | authenticated | Publish a post, or a reply to one |
+| `GET /posts/{post_id}` | public | A single post |
+| `PATCH /posts/{post_id}` | author | Change the text, for 60 minutes |
+| `DELETE /posts/{post_id}` | author | Delete the post (soft deletion) |
+| `GET /users/{username}/posts` | public | A user's posts, newest first |
+
+"Public" means no session is needed for a public account's posts. The answer
+still depends on who is asking, so these responses are sent with
+`Cache-Control: no-store`.
+
+A post is text only. A reply is a post whose `parent_post_id` names another
+post; there is no separate reply table or model, and a reply can be replied to
+in turn. Everything below applies to replies exactly as it does to posts.
+
+```json
+{
+  "id": "…",
+  "author": {"id": "…", "username": "alice", "display_name": "Alice", "avatar_url": null},
+  "content": "Hello Hopsnop!",
+  "parent_post_id": null,
+  "is_reply": false,
+  "created_at": "2026-10-05T12:00:00Z",
+  "updated_at": "2026-10-05T12:00:00Z"
+}
+```
+
+A request can set `content` and, when creating, `parent_post_id`. The author is
+always the authenticated user, and the timestamps and the deletion state are
+set by the server; any other field in a request body is ignored.
+
+### Content
+
+1 to 300 characters. Surrounding whitespace is trimmed first, so text that is
+only whitespace is empty and is rejected. Text that is too long is rejected,
+never cut. Characters are Unicode code points, not bytes, which is also how the
+`char_length` check constraint on `posts.content` counts them: an emoji made of
+several code points counts as several.
+
+Content is stored and returned exactly as written, as JSON; escaping it for
+display is the client's job.
+
+### Visibility
+
+Who may see a post is decided in one place, `_visible_posts` in
+`app/services/posts.py`. Every read, and every check that a post exists for
+someone, goes through it.
+
+- A post is visible if it is not deleted, its author's account is shown at all
+  (active and verified, the same rule as for profiles), and the author allows
+  the viewer to read their posts.
+- A **public** account's posts can be read by anyone.
+- A **private** account's posts can be read only by that account. This is
+  temporary: once following exists, approved followers are added to
+  `_posts_readable_by`, and every endpoint picks that up.
+
+The account that decides is always the post's own author. A private account's
+reply to a public post is private; a public account's reply stays visible when
+the post it answers is deleted or becomes private.
+
+A post the caller may not see is answered like one that does not exist:
+`404 Post not found`, from the same single query. That holds for writes too.
+`PATCH` or `DELETE` on a hidden post is a `404`, never a `403`, so a write
+attempt cannot confirm that an id belongs to a post. `403` is only given for a
+post the caller can read but did not write.
+
+`GET /users/{username}/posts` answers `404 User not found` for the accounts
+whose profile is not shown. For a private account, whose profile is public, it
+answers `403` to everyone but the owner, whether or not the account has posts.
+
+### Editing
+
+Only the author can edit, only `content`, and only while the post is less than
+60 minutes old. The deadline is `created_at` plus 60 minutes; it is computed,
+not stored, and editing does not move it. At exactly 60 minutes the post is
+locked, and `PATCH` answers `409`.
+
+`updated_at` is the time of the last edit and equals `created_at` for a post
+that was never edited. Nothing else changes it, including deletion.
+
+### Deletion
+
+`DELETE` sets `deleted_at` and returns `204`. The row is kept, together with
+its likes, reposts and replies. From then on the post is not found by anyone,
+its author included: it cannot be read, edited, replied to, or deleted again
+(`404`).
+
+### Replies
+
+`parent_post_id` must name a post the author can currently see. A parent that
+does not exist, was deleted, or is hidden gives the same `404 Parent post not
+found`. The parent of a post cannot be changed afterwards.
+
+### Pagination
+
+Lists are paginated with a cursor, not with an offset or page number:
+
+```
+GET /users/alice/posts?limit=20
+{"items": [...], "next_cursor": "AAZc…"}
+
+GET /users/alice/posts?limit=20&cursor=AAZc…
+{"items": [...], "next_cursor": null}
+```
+
+`limit` is 1 to 50 and defaults to 20; anything else is a `422`. `next_cursor`
+is `null` on the last page.
+
+Rows are ordered by `created_at` descending, then `id` descending, so the order
+is total even when timestamps are equal. The cursor encodes those two values of
+the last row of the page, and the next page is the rows that sort after them
+(`WHERE (created_at, id) < (…, …)`). Because a page is addressed by a position
+and not by a count of rows to skip, posts that are created or deleted between
+two requests cause neither duplicates nor gaps.
+
+The cursor is opaque but not secret: it holds nothing the page did not already
+show, and it only selects a position. What a query returns is decided by the
+query's own conditions on every page, so a cursor, genuine or made up, gives no
+access to anything. A value that is not a cursor is a `400`.
+
+The implementation is `app/core/pagination.py` (`paginate`) and the
+`Pagination` dependency in `app/api/deps.py`; neither is specific to posts.
+
+### Errors
+
+| Status | When |
+| --- | --- |
+| `400` | Malformed `cursor` |
+| `401` | No usable session, on an endpoint that needs one |
+| `403` | Not the author of the post; reading a private account's posts; unverified email; cross-site request |
+| `404` | Post, parent post or user not found, or not visible to the caller |
+| `409` | The 60-minute edit window has passed |
+| `422` | Invalid `content`, `parent_post_id`, `post_id` or `limit` |
 
 ## Tests
 

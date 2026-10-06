@@ -190,8 +190,10 @@ def test_no_get_route_changes_state() -> None:
         "/auth/me",
         "/auth/sessions",
         "/health",
+        "/posts/{post_id}",
         "/users/me",
         "/users/{username}",
+        "/users/{username}/posts",
     ]
 
 

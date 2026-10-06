@@ -6,9 +6,11 @@ from fastapi.responses import JSONResponse
 
 from app.api.auth import router as auth_router
 from app.api.deps import verify_request_origin
+from app.api.posts import router as posts_router
 from app.api.users import router as users_router
 from app.core.config import settings
 from app.services.auth import AuthError
+from app.services.posts import PostError
 
 app = FastAPI(
     title="Hopsnop API",
@@ -30,13 +32,17 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(users_router)
+app.include_router(posts_router)
 
 
 # Every error has the same shape: {"detail": ...}.
 
 
 @app.exception_handler(AuthError)
-async def handle_auth_error(request: Request, exc: AuthError) -> JSONResponse:
+@app.exception_handler(PostError)
+async def handle_service_error(
+    request: Request, exc: AuthError | PostError
+) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 

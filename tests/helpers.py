@@ -8,13 +8,13 @@ from urllib.parse import parse_qs, urlsplit
 
 from fastapi.testclient import TestClient
 from httpx import Response
-from sqlalchemy import event
+from sqlalchemy import event, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.security import hash_password
 from app.db.session import engine
-from app.models import Follow, User
+from app.models import Follow, Post, User
 
 PASSWORD = "correct horse battery staple"
 # Hashed once: Argon2 is slow by design, and most tests only need an account
@@ -50,6 +50,40 @@ def follow(session: Session, follower: User, following: User) -> None:
     """Make one user follow another, directly in the database."""
     session.add(Follow(follower_id=follower.id, following_id=following.id))
     session.flush()
+
+
+def add_post(
+    session: Session,
+    author: User,
+    content: str = "Hello, Hopsnop!",
+    *,
+    parent: Post | None = None,
+    created_at: datetime | None = None,
+    deleted: bool = False,
+) -> Post:
+    """A post written directly to the database, as if created at ``created_at``."""
+    created_at = created_at or datetime.now(timezone.utc)
+    post = Post(
+        author_id=author.id,
+        content=content,
+        parent_post_id=parent.id if parent is not None else None,
+        created_at=created_at,
+        updated_at=created_at,
+        deleted_at=created_at if deleted else None,
+    )
+    session.add(post)
+    session.flush()
+    return post
+
+
+def post_columns(session: Session, post_id: object) -> dict[str, object]:
+    """Every column of a post's row, as currently stored.
+
+    Read with a plain query, so it shows what is in the database and not what
+    an object in the session remembers.
+    """
+    row = session.execute(select(Post.__table__).where(Post.id == post_id)).one()
+    return dict(row._mapping)
 
 
 def registration(**overrides: object) -> dict:
