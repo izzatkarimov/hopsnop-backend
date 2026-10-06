@@ -1,4 +1,4 @@
-"""Posts: writing, reading, editing and deleting them.
+"""Posts: writing, reading, editing and deleting them, and the feed of them.
 
 A reply is a post like any other. It only has ``parent_post_id`` set, and it
 follows every rule here in its own right: its own author, its own visibility,
@@ -85,6 +85,9 @@ _ACCOUNT_IS_SHOWN = (
     User.email_verified_at.is_not(None),
 )
 
+# An account whose posts are open to everyone.
+_ACCOUNT_IS_PUBLIC = User.is_private.is_(False)
+
 
 def _posts_readable_by(viewer: User | None) -> ColumnElement[bool]:
     """Condition on a ``users`` row: may ``viewer`` read that account's posts?
@@ -95,10 +98,9 @@ def _posts_readable_by(viewer: User | None) -> ColumnElement[bool]:
     can, for now, only be read by the account itself. Once following exists,
     its approved followers are added here, and every query picks that up.
     """
-    is_public = User.is_private.is_(False)
     if viewer is None:
-        return is_public
-    return or_(is_public, User.id == viewer.id)
+        return _ACCOUNT_IS_PUBLIC
+    return or_(_ACCOUNT_IS_PUBLIC, User.id == viewer.id)
 
 
 def _visible_posts(viewer: User | None) -> Select[tuple[Post]]:
@@ -171,6 +173,33 @@ def list_user_posts(
     return paginate(
         db,
         _visible_posts(viewer).where(Post.author_id == account.id),
+        Post,
+        limit=limit,
+        after=after,
+    )
+
+
+def list_for_you_feed(
+    db: Session,
+    viewer: User | None,
+    *,
+    limit: int,
+    after: Cursor | None = None,
+) -> Page[Post]:
+    """One page of the For You feed: public accounts' posts, newest first.
+
+    For now this is not a recommendation. It is every post that anyone may
+    read, in the order they were written, with replies in it as the posts
+    they are.
+
+    The feed is public content, so a private account's posts are in it for
+    nobody, the account itself included. That is a rule of this feed, and it
+    is applied on top of what ``viewer`` may see, not instead of it: whatever
+    ``_visible_posts`` hides from a viewer is hidden here as well.
+    """
+    return paginate(
+        db,
+        _visible_posts(viewer).where(_ACCOUNT_IS_PUBLIC),
         Post,
         limit=limit,
         after=after,

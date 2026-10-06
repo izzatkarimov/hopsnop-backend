@@ -363,6 +363,66 @@ The implementation is `app/core/pagination.py` (`paginate`) and the
 | `409` | The 60-minute edit window has passed |
 | `422` | Invalid `content`, `parent_post_id`, `post_id` or `limit` |
 
+## Feed
+
+| Endpoint | Access | Purpose |
+| --- | --- | --- |
+| `GET /feed` | public | For You: the posts of public accounts, newest first |
+
+For You is, for now, deliberately not a recommendation. It is public content in
+chronological order: every post of every public account, newest first. Nothing
+is ranked, and likes, reposts and follows play no part in it.
+
+```
+GET /feed?limit=20
+{"items": [...], "next_cursor": "AAZc…"}
+
+GET /feed?limit=20&cursor=AAZc…
+{"items": [...], "next_cursor": null}
+```
+
+The answer is the same page of the same post objects as
+`GET /users/{username}/posts`, with the same cursor, the same limits and the
+same errors (see [Pagination](#pagination)). It is sent with
+`Cache-Control: no-store`.
+
+### What is in it
+
+A post is in the feed if the caller may see it under the
+[visibility rules](#visibility) (not deleted, author active and verified) and
+its author's account is public. The second condition is the feed's own, added
+by `list_for_you_feed` on top of `_visible_posts`:
+
+- A private account's posts are in the feed for nobody, the account itself
+  included. The owner still reads them through `GET /posts/{post_id}` and
+  `GET /users/{username}/posts`.
+- No session is needed, and the answer is currently the same with or without
+  one. The caller is still passed to `_visible_posts`, so a rule added there
+  later applies to the feed without a change here.
+- Replies are posts. Each appears at its own place in time with its
+  `parent_post_id`; nothing is grouped into conversations. A public account's
+  reply stays in the feed when the post it answers is deleted or becomes
+  private, and only the parent's id is shown, as on every other endpoint.
+
+Posts that are not shown are left out by the query itself, before the page is
+cut. They take up no room on a page, and nothing in a response, `next_cursor`
+included, says that they exist.
+
+### Query
+
+One statement returns a page together with its authors, however many posts and
+authors there are: `posts` joined to `users`, filtered, ordered and limited to
+`limit + 1` rows by the database.
+
+It is served by the existing `ix_posts_created_at` index. PostgreSQL walks it
+backwards from the cursor's position and stops when the page is full, so a deep
+page costs the same as the first one. No index was added for the feed: a
+composite `(created_at, id)` index was measured on 300,000 posts and changed
+nothing, because rows that share a timestamp to the microsecond are rare. What
+the scan cannot skip cheaply is a long run of consecutive posts by private or
+deactivated accounts, since that is decided in `users`; in the same measurement
+5,000 such posts in a row cost under 2 ms.
+
 ## Tests
 
 ```bash
@@ -375,4 +435,5 @@ The API tests run the application inside that same transaction and always use
 the production settings, whatever `ENVIRONMENT` is set to locally.
 
 Several tests assume empty tables, so they can fail if the development database
-contains accounts with the usernames the tests use (`alice`, `bob`).
+contains accounts with the usernames the tests use (`alice`, `bob`), or any
+posts, which would appear in the feed.

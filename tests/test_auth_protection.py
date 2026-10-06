@@ -189,6 +189,7 @@ def test_no_get_route_changes_state() -> None:
     assert get_routes == [
         "/auth/me",
         "/auth/sessions",
+        "/feed",
         "/health",
         "/posts/{post_id}",
         "/users/me",

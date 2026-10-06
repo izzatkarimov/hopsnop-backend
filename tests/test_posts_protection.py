@@ -80,7 +80,7 @@ def test_the_only_post_routes_are_the_intended_ones() -> None:
 def test_nothing_from_later_phases_is_exposed() -> None:
     paths = " ".join(app.openapi()["paths"])
 
-    later_phases = ("feed", "like", "repost", "follow", "stor", "upload", "media")
+    later_phases = ("like", "repost", "follow", "stor", "upload", "media")
     for later in (*later_phases, "search", "notif", "mention", "hashtag"):
         assert later not in paths
 
@@ -140,7 +140,8 @@ def test_single_post_accepts_no_other_write_methods(
 def test_collection_only_accepts_post(
     alice_client: TestClient, session: Session, alice_account: User, method: str
 ) -> None:
-    # In particular there is no listing of everybody's posts.
+    # In particular there is no listing here. Everybody's posts are listed by
+    # the feed, under its own rules.
     add_post(session, alice_account)
     before = all_posts(session)
 
