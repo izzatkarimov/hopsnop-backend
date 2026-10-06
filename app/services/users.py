@@ -36,8 +36,8 @@ EDITABLE_FIELDS = frozenset({"display_name", "bio", "avatar_url"})
 # Which accounts there are, as far as anyone else is concerned. A deactivated
 # account, and one whose email address was never verified, cannot be logged
 # in to, so neither is shown: not as a profile, not in a list of followers,
-# and not as someone to follow.
-_ACCOUNT_IS_SHOWN = (
+# not as someone to follow, and not as the author of a story.
+ACCOUNT_IS_SHOWN = (
     User.is_active.is_(True),
     User.email_verified_at.is_not(None),
 )
@@ -108,8 +108,8 @@ def get_public_profile(
             User.created_at,
             followers_count.label("followers_count"),
             following_count.label("following_count"),
-            _is_followed_by(viewer, User.id).label("following"),
-        ).where(User.username == username, *_ACCOUNT_IS_SHOWN)
+            is_followed_by(viewer, User.id).label("following"),
+        ).where(User.username == username, *ACCOUNT_IS_SHOWN)
     ).one_or_none()
     if row is None:
         return None
@@ -171,7 +171,7 @@ def _follow_counts(
 # --- following -----------------------------------------------------------
 
 
-def _is_followed_by(
+def is_followed_by(
     viewer: User | None, user_id: ColumnElement[uuid.UUID] | uuid.UUID
 ) -> ColumnElement[bool]:
     """Condition: does ``viewer`` follow the user with this id?
@@ -193,7 +193,7 @@ def _shown_user_id(db: Session, username: str) -> uuid.UUID:
     shown and with the answer its profile gives.
     """
     user_id = db.scalar(
-        select(User.id).where(User.username == username, *_ACCOUNT_IS_SHOWN)
+        select(User.id).where(User.username == username, *ACCOUNT_IS_SHOWN)
     )
     if user_id is None:
         raise UserNotFoundError
@@ -236,7 +236,7 @@ def set_follow(db: Session, user: User, username: str, *, following: bool) -> bo
         )
 
     # Read from the rows, after the change and inside its transaction.
-    now_following = db.scalar(select(_is_followed_by(user, target_id)))
+    now_following = db.scalar(select(is_followed_by(user, target_id)))
     db.commit()
     return now_following
 
@@ -248,8 +248,8 @@ def get_follow_status(db: Session, viewer: User | None, username: str) -> bool:
     about, so an account that is not shown is not found here either.
     """
     following = db.scalar(
-        select(_is_followed_by(viewer, User.id)).where(
-            User.username == username, *_ACCOUNT_IS_SHOWN
+        select(is_followed_by(viewer, User.id)).where(
+            User.username == username, *ACCOUNT_IS_SHOWN
         )
     )
     if following is None:
@@ -325,7 +325,7 @@ def _list_follows(
                 User.avatar_url,
             )
         )
-        .where(account == account_id, *_ACCOUNT_IS_SHOWN),
+        .where(account == account_id, *ACCOUNT_IS_SHOWN),
         Follow,
         limit=limit,
         after=after,

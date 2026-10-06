@@ -21,6 +21,7 @@ from app.db.base import Base
 from app.main import app
 from app.models import User
 from app.schemas.auth import AccountResponse, RegisterRequest
+from app.schemas.story import CreateStoryRequest, StoryResponse
 from app.schemas.user import (
     FollowResponse,
     MyProfileResponse,
@@ -123,6 +124,8 @@ def test_no_schema_has_a_privacy_field() -> None:
         PublicProfileResponse,
         UserSummaryResponse,
         FollowResponse,
+        CreateStoryRequest,
+        StoryResponse,
     )
 
     for schema in schemas:

@@ -79,7 +79,7 @@ def test_the_only_post_routes_are_the_intended_ones() -> None:
 def test_nothing_from_later_phases_is_exposed() -> None:
     paths = " ".join(app.openapi()["paths"])
 
-    later_phases = ("stor", "upload", "media")
+    later_phases = ("upload", "media")
     for later in (*later_phases, "search", "notif", "mention", "hashtag"):
         assert later not in paths
 

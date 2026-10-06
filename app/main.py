@@ -8,10 +8,12 @@ from app.api.auth import router as auth_router
 from app.api.deps import verify_request_origin
 from app.api.feed import router as feed_router
 from app.api.posts import router as posts_router
+from app.api.stories import router as stories_router
 from app.api.users import router as users_router
 from app.core.config import settings
 from app.services.auth import AuthError
 from app.services.posts import PostError
+from app.services.stories import StoryError
 from app.services.users import UserError
 
 app = FastAPI(
@@ -36,6 +38,7 @@ app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(posts_router)
 app.include_router(feed_router)
+app.include_router(stories_router)
 
 
 # Every error has the same shape: {"detail": ...}.
@@ -43,9 +46,10 @@ app.include_router(feed_router)
 
 @app.exception_handler(AuthError)
 @app.exception_handler(PostError)
+@app.exception_handler(StoryError)
 @app.exception_handler(UserError)
 async def handle_service_error(
-    request: Request, exc: AuthError | PostError | UserError
+    request: Request, exc: AuthError | PostError | StoryError | UserError
 ) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 

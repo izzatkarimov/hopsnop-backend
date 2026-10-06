@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import CheckConstraint, ForeignKey, Index, String, func
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, query_expression, relationship
 
 from app.db.base import Base
 
@@ -39,6 +39,15 @@ class Story(Base):
     caption: Mapped[str | None] = mapped_column(String(150))
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     expires_at: Mapped[datetime]
+
+    # How many users have viewed the story, and whether the reader of the
+    # story is one of them. These are not columns and nothing is stored: the
+    # query that loads a story for a reader computes them from story_views
+    # (``app.services.stories._visible_stories``). The count is None for
+    # every reader but the author, and both are None on a story that was
+    # loaded in any other way.
+    view_count: Mapped[int | None] = query_expression()
+    viewed_by_me: Mapped[bool] = query_expression()
 
     author: Mapped[User] = relationship(back_populates="stories")
 

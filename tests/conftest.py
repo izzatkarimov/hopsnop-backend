@@ -23,6 +23,7 @@ from app.db.session import engine
 from app.main import app
 from app.models import Post, Story, User
 from app.services import posts as posts_service
+from app.services import stories as stories_service
 from app.services.email import get_email_sender
 from helpers import add_user, log_in
 
@@ -181,7 +182,10 @@ def bob_client(make_client: Callable[..., TestClient], bob_account: User) -> Tes
 
 
 class Clock:
-    """Stands in for the posts service's clock. It only moves when told to."""
+    """Stands in for the clock of the posts and stories services.
+
+    It only moves when told to.
+    """
 
     def __init__(self) -> None:
         self.now = datetime.now(timezone.utc)
@@ -195,7 +199,8 @@ class Clock:
 
 @pytest.fixture
 def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
-    """Puts the time that the post rules see under the test's control."""
+    """Puts the time that the post and story rules see under the test's control."""
     clock = Clock()
     monkeypatch.setattr(posts_service, "_now", clock)
+    monkeypatch.setattr(stories_service, "_now", clock)
     return clock

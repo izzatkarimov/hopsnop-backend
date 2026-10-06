@@ -870,7 +870,7 @@ def test_unexpected_error_reveals_nothing_and_leaves_nothing_behind(
     if method == "DELETE":
         add_follow(session, bob_account, alice_account)
     before = rows(session)
-    is_followed_by = users_service._is_followed_by
+    is_followed_by = users_service.is_followed_by
 
     def fail_once_the_change_is_made(viewer, user_id):
         # Asked about one user by id, as it is after the write, rather than
@@ -880,7 +880,7 @@ def test_unexpected_error_reveals_nothing_and_leaves_nothing_behind(
         return is_followed_by(viewer, user_id)
 
     monkeypatch.setattr(
-        users_service, "_is_followed_by", fail_once_the_change_is_made
+        users_service, "is_followed_by", fail_once_the_change_is_made
     )
     client = make_client(raise_server_exceptions=False)
     log_in(client, "bob")

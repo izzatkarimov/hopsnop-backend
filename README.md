@@ -590,6 +590,130 @@ primary key. Requests insert with `ON CONFLICT DO NOTHING` instead of checking
 first, so two identical requests arriving at once cannot both insert and
 neither fails.
 
+## Stories
+
+| Endpoint | Access | Purpose |
+| --- | --- | --- |
+| `POST /stories` | authenticated | Publish a story |
+| `GET /stories` | authenticated | Active stories of the caller and of the users they follow |
+| `GET /stories/{story_id}` | authenticated | A single active story |
+| `DELETE /stories/{story_id}` | author | Delete the story |
+| `POST /stories/{story_id}/view` | authenticated | Record that the caller viewed the story |
+
+A story is an image, by its URL, with an optional caption, shown for 24 hours.
+Every endpoint needs a session of an active account with a verified email
+address (`401` without a session, `403` for an unverified address). Nobody reads
+a story anonymously, and every response is sent with `Cache-Control: no-store`.
+
+```json
+{
+  "id": "…",
+  "author": {"username": "alice", "display_name": "Alice", "avatar_url": null},
+  "media_url": "https://media.example.com/stories/1.jpg",
+  "media_type": "image",
+  "caption": "Good morning",
+  "created_at": "2026-10-06T12:00:00Z",
+  "expires_at": "2026-10-07T12:00:00Z",
+  "viewed_by_me": false,
+  "view_count": null
+}
+```
+
+### Publishing
+
+A request can set `media_url` and `caption`; any other field in the body is
+ignored. The author is always the authenticated user, `media_type` is always
+`image`, and both timestamps are set by the server.
+
+| Field | Rule |
+| --- | --- |
+| `media_url` | required, an absolute `http(s)` URL |
+| `caption` | optional, up to 150 characters of plain text after trimming; blank or `null` is no caption |
+
+`media_url` is checked for its form only. The server never requests it, and
+there are no uploads. A story cannot be edited.
+
+### Who may see a story
+
+Who may see a story is decided in one place, `_shown_to` in
+`app/services/stories.py`. Every read, view and deletion goes through it. A
+story is shown to the caller if all of this holds:
+
+- it has not expired;
+- its author's account is shown (active and verified, the same rule as for
+  profiles);
+- the caller is the author, or follows the author at this moment.
+
+The last condition is the `follows` table and the same check that answers
+`follow-status` (see [Follows](#follows)). It is evaluated by every query and
+nothing is kept per reader, so unfollowing ends access at once and following
+again brings the stories that are still active back. Following goes one way:
+being followed by someone shows nothing of theirs. There are no other rules
+about who may see a story.
+
+Any other story is answered like one that does not exist: `404 Story not
+found`, from the same single query, whether it is expired, deleted, by an
+account the caller does not follow, or by one that is not shown. That holds for
+viewing and deleting too.
+
+### Expiration
+
+`expires_at` is `created_at` plus 24 hours. It is stored with the story when it
+is created and never moved. A story stops being shown at that moment itself,
+also to its author. Expired stories stay in the table; nothing removes them yet.
+
+### The list
+
+`GET /stories` is the caller's own active stories and those of the users they
+follow, in one flat list, newest first. Stories the caller has viewed stay in
+it where they were; `viewed_by_me` tells them apart. Nothing is grouped by
+author. Paging is the cursor pagination of the other lists (see
+[Pagination](#pagination)): the same `limit`, the same cursor, the same `400`
+for a value that is not a cursor.
+
+Reading the list or a single story records nothing. Like every `GET` in the
+API, both are free of side effects.
+
+### Views
+
+`POST /stories/{story_id}/view` records that the caller has viewed a story they
+can see and answers `200` with the resulting state:
+
+```json
+{"viewed": true}
+```
+
+A user views a story once. The request can be repeated and is answered the same
+way each time, never with `409`; the primary key `(story_id, viewer_id)` rules
+out a second row, and requests insert with `ON CONFLICT DO NOTHING` instead of
+checking first, so two identical requests arriving at once cannot both insert
+and neither fails. Whose view it is, is always the signed-in user.
+
+An author's look at their own story is not a view: nothing is recorded and the
+answer is `{"viewed": false}`.
+
+`view_count` is told to the author alone. For every other reader it is `null`,
+and the query itself returns `NULL` for it, so the number does not leave the
+database. Who viewed a story is told to nobody: there is no endpoint that lists
+viewers. A view stays recorded, and counted, when the viewer later unfollows
+the author.
+
+### Deletion
+
+`DELETE` removes the row and returns `204`; the story's views are removed with
+it (`ON DELETE CASCADE`). Unlike a post, a story is not kept. Only the author
+can delete: a follower, who can read the story, gets `403`, and anyone who
+cannot see it gets `404`.
+
+### Query and indexes
+
+One statement returns a page together with its authors, the caller's own
+views and, for the caller's own stories, the view counts. No schema change and
+no index was added: `ix_stories_author_id_expires_at` serves the active stories
+of an author, the primary key of `follows` the follow check, the primary key of
+`story_views` the count, and `ix_story_views_viewer_id_story_id` the caller's
+own views.
+
 ## Tests
 
 ```bash

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.security import hash_password
 from app.db.session import engine
-from app.models import Follow, Post, User
+from app.models import Follow, Post, Story, User
 
 PASSWORD = "correct horse battery staple"
 # Hashed once: Argon2 is slow by design, and most tests only need an account
@@ -74,6 +74,32 @@ def add_post(
     session.add(post)
     session.flush()
     return post
+
+
+def add_story(
+    session: Session,
+    author: User,
+    caption: str | None = None,
+    *,
+    created_at: datetime | None = None,
+    media_url: str = "https://media.example.com/stories/1.jpg",
+) -> Story:
+    """A story written directly to the database, as if created at ``created_at``.
+
+    Like one made through the API, it expires 24 hours after that.
+    """
+    created_at = created_at or datetime.now(timezone.utc)
+    story = Story(
+        author_id=author.id,
+        media_url=media_url,
+        media_type="image",
+        caption=caption,
+        created_at=created_at,
+        expires_at=created_at + timedelta(hours=24),
+    )
+    session.add(story)
+    session.flush()
+    return story
 
 
 def post_columns(session: Session, post_id: object) -> dict[str, object]:
