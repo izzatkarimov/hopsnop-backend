@@ -68,6 +68,8 @@ def test_the_only_post_routes_are_the_intended_ones() -> None:
         ("GET", "/posts/{post_id}"),
         ("PATCH", "/posts/{post_id}"),
         ("DELETE", "/posts/{post_id}"),
+        # Read-only: a reply is written through POST /posts like any post.
+        ("GET", "/posts/{post_id}/replies"),
         ("POST", "/posts/{post_id}/like"),
         ("DELETE", "/posts/{post_id}/like"),
         ("POST", "/posts/{post_id}/repost"),

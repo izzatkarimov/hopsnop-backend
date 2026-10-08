@@ -117,7 +117,7 @@ def walk(client: TestClient, *, limit: int) -> list:
 # --- the surface ---------------------------------------------------------
 
 
-def test_the_only_feed_route_is_the_intended_one() -> None:
+def test_the_only_feed_routes_are_the_intended_ones() -> None:
     routes = {
         (method.upper(), path)
         for path, operations in app.openapi()["paths"].items()
@@ -125,13 +125,20 @@ def test_the_only_feed_route_is_the_intended_one() -> None:
         for method in operations
     }
 
-    # One feed, and it can only be read.
-    assert routes == {("GET", "/feed")}
+    # For You and Following, and both can only be read.
+    assert routes == {("GET", "/feed"), ("GET", "/feed/following")}
 
 
 @pytest.mark.parametrize(
     "path",
-    ["/feed/following", "/feed/for-you", "/feed/home", "/feed/alice", "/feeds"],
+    [
+        "/feed/followers",
+        "/feed/for-you",
+        "/feed/home",
+        "/feed/alice",
+        "/feed/following/alice",
+        "/feeds",
+    ],
 )
 def test_there_is_no_other_feed(
     alice_client: TestClient, session: Session, alice_account: User, path: str
@@ -438,7 +445,7 @@ def test_every_feed_error_has_the_same_shape(alice_client: TestClient) -> None:
         alice_client.get("/feed?limit=0"),  # 422
         alice_client.get("/feed?limit=51"),  # 422
         alice_client.post("/feed", json={}),  # 405
-        alice_client.get("/feed/following"),  # 404
+        alice_client.get("/feed/home"),  # 404
     ]
 
     assert [response.status_code for response in errors] == [400, 422, 422, 405, 404]

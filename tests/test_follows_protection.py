@@ -152,6 +152,8 @@ def test_the_only_follow_routes_are_the_intended_ones() -> None:
         ("GET", "/users/{username}/follow-status"),
         ("GET", "/users/{username}/followers"),
         ("GET", "/users/{username}/following"),
+        # What following is for. It reads follows and writes none.
+        ("GET", "/feed/following"),
     }
 
 
@@ -166,7 +168,7 @@ def test_there_is_nothing_to_request_approve_or_wait_for() -> None:
 
     # Following is immediate. There is no state between not following and
     # following, anywhere: not in the routes, the answers or the table.
-    assert len(routes) == 4
+    assert len(routes) == 5
     for word in ("request", "pending", "approv", "accept", "reject", "private"):
         assert word not in documented, word
     assert set(FollowResponse.model_fields) == {"following"}

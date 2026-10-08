@@ -1,5 +1,5 @@
 """Posts: writing, reading, editing, deleting, liking and reposting them, and
-the feed of them.
+the feeds of them.
 
 A reply is a post like any other. It only has ``parent_post_id`` set, and it
 follows every rule here in its own right: its own author, its own visibility,
@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session, contains_eager, with_expression
 
 from app.core.pagination import Cursor, Page, paginate
 from app.models import Like, Post, Repost, User
+from app.services.users import is_followed_by
 
 EDIT_WINDOW_MINUTES = 60
 # How long after it was created a post can still be edited. The deadline is
@@ -231,6 +232,71 @@ def list_for_you_feed(
     return paginate(
         db,
         _visible_posts(viewer),
+        Post,
+        limit=limit,
+        after=after,
+    )
+
+
+def list_following_feed(
+    db: Session,
+    viewer: User,
+    *,
+    limit: int,
+    after: Cursor | None = None,
+) -> Page[Post]:
+    """One page of the Following feed: the posts that are shown and whose
+    author ``viewer`` follows, newest first.
+
+    It is ``_visible_posts`` with one more condition, and that condition is
+    worked out from ``follows`` by the query itself, every time. Nothing
+    about it is stored per reader, so unfollowing an account takes all of its
+    posts out at once and following it again brings back those that are
+    shown then.
+
+    Replies are in it as the posts they are, by their own author: whose post
+    a reply answers plays no part. A repost puts nothing in it. Nobody
+    follows themselves, so ``viewer``'s own posts are never in it.
+    """
+    return paginate(
+        db,
+        _visible_posts(viewer).where(is_followed_by(viewer, Post.author_id)),
+        Post,
+        limit=limit,
+        after=after,
+    )
+
+
+def list_replies(
+    db: Session,
+    post_id: uuid.UUID,
+    viewer: User | None,
+    *,
+    limit: int,
+    after: Cursor | None = None,
+) -> Page[Post]:
+    """One page of the replies to the post with this id, newest first.
+
+    Only the posts that answer this one directly: a reply to one of them is
+    in that reply's own list. A post that is not shown is not found, exactly
+    as when it is read, so its replies cannot be listed through it. Each of
+    them is still a post of its own and is found wherever else it is shown.
+
+    Which replies are shown is decided for each by its own author, like for
+    any other post. Whom ``viewer`` follows plays no part.
+    """
+    # Only whether there is such a post is needed here, not the post.
+    shown = db.scalar(
+        select(Post.id)
+        .join(Post.author)
+        .where(Post.id == post_id, Post.deleted_at.is_(None), *_ACCOUNT_IS_SHOWN)
+    )
+    if shown is None:
+        raise PostNotFoundError
+
+    return paginate(
+        db,
+        _visible_posts(viewer).where(Post.parent_post_id == post_id),
         Post,
         limit=limit,
         after=after,

@@ -236,6 +236,7 @@ for display is the client's job.
 | `GET /posts/{post_id}` | public | A single post |
 | `PATCH /posts/{post_id}` | author | Change the text, for 60 minutes |
 | `DELETE /posts/{post_id}` | author | Delete the post (soft deletion) |
+| `GET /posts/{post_id}/replies` | public | The replies to the post, newest first |
 | `POST /posts/{post_id}/like` | authenticated | Like the post |
 | `DELETE /posts/{post_id}/like` | authenticated | Take the like back |
 | `POST /posts/{post_id}/repost` | authenticated | Repost the post |
@@ -330,6 +331,29 @@ its author included: it cannot be read, edited, replied to, or deleted again
 does not exist, was deleted, or is hidden gives the same `404 Parent post not
 found`. The parent of a post cannot be changed afterwards.
 
+`GET /posts/{post_id}/replies` lists the replies to a post, newest first, as
+the same page of the same post objects as every other list of posts (see
+[Pagination](#pagination)). It needs no session, and whom the caller follows
+plays no part: Alice posts, Bob replies, and Carol, who follows neither, reads
+Bob's reply there like anyone else.
+
+- Only direct replies are listed. A reply to a reply is in that reply's own
+  list; nothing is flattened or nested.
+- The post asked about must be shown. One that does not exist, was deleted, or
+  whose author's account is not shown gives `404 Post not found`, the answer
+  and the single query that reading it gives, and its replies are never read.
+  Each of them is still a post of its own, found by its id, in its author's
+  list and in the feeds.
+- Each reply is shown or not by its own author, like any post. Replies that
+  are not shown are left out by the query, before the page is cut.
+
+A page is two statements: one that finds the post, and one for the replies with
+their authors and counts, however many there are. The second is served by the
+existing `ix_posts_parent_post_id_created_at`, walked backwards from the
+cursor's position. No index was added: measured on a post with 50,000 replies
+among 670,000 posts, the first page and a page 150 days deep each took about
+0.2 ms.
+
 ### Likes and reposts
 
 `POST` makes the caller's like or repost of a post, `DELETE` takes it back.
@@ -423,6 +447,7 @@ The implementation is `app/core/pagination.py` (`paginate`) and the
 | Endpoint | Access | Purpose |
 | --- | --- | --- |
 | `GET /feed` | public | For You: every post that is shown, newest first |
+| `GET /feed/following` | authenticated | Following: the posts of the users the caller follows |
 
 For You is, for now, deliberately not a recommendation. It is every post that
 is shown, in chronological order, newest first. Nothing is ranked, and likes,
@@ -449,7 +474,8 @@ feed has no rule of its own; `list_for_you_feed` is `_visible_posts`, paginated.
 
 - No session is needed, and the same posts are in the feed with or without
   one. An author finds their own posts in it like anyone else's.
-- Whom the caller follows changes nothing. This is not a Following feed.
+- Whom the caller follows changes nothing. That is the
+  [Following feed](#following).
 - Replies are posts. Each appears at its own place in time with its
   `parent_post_id`; nothing is grouped into conversations. A reply stays in the
   feed when the post it answers is deleted or its author is deactivated, and
@@ -474,6 +500,61 @@ the scan cannot skip cheaply is a long run of consecutive posts by accounts
 that are not shown, since that is decided in `users`; in the same measurement
 5,000 such posts in a row cost under 2 ms.
 
+### Following
+
+`GET /feed/following` is the For You query with one more condition: the
+caller follows the post's author. It answers with the same page of the same
+post objects, the same cursor, the same limits and `Cache-Control: no-store`.
+
+It needs a session of an active account with a verified email address. Without
+one the answer is `401`, also for a cookie that is stale, expired or revoked
+and for a deactivated account; For You answers those as anonymous requests,
+this feed does not. A session of an unverified account gets `403`.
+
+Whose feed it is, is always the signed-in user. The endpoint takes `limit` and
+`cursor` and nothing else, so there is no way to name another user, and any
+other parameter is ignored.
+
+- The condition is `is_followed_by`, the same `EXISTS` on `follows` that
+  profiles and stories use, evaluated by the query on every request. Nothing
+  is stored per reader. Unfollowing takes all of an account's posts out at
+  once, old ones included, and following again brings back those that are
+  shown then.
+- A user's own posts are not in it: nobody follows themselves.
+- Replies are in it as in For You, each by its own author. A followed
+  account's reply is there whoever wrote the post it answers, and a reply by
+  someone who is not followed is not there even under a followed account's
+  post. A reply stays when the post it answers is deleted; of that post only
+  the id is shown.
+- A repost puts nothing in it. Reposts are counted on the post and that is
+  all.
+- Following nobody, or only accounts without posts, is an empty page with
+  `200`.
+
+A cursor is a position in time here too, and the same one For You uses. One
+taken from another list, or made up, selects a position among the posts the
+caller's own follows allow and nothing else.
+
+A page is one statement, after the one that finds the session: `posts` joined
+to `users` with the `follows` condition, filtered, ordered and limited by the
+database. No index was added. Measured on 20,000 accounts, 670,000 posts and
+405,000 follows, PostgreSQL chooses between two plans from the existing
+indexes:
+
+| Viewer follows | First page | Deep page | Plan |
+| --- | --- | --- | --- |
+| nobody | 0.05 ms | | `pk_follows`, then nothing |
+| 5 accounts | 0.8 ms | 0.2 ms | `pk_follows`, then `ix_posts_author_id_created_at` per author, top-N sort |
+| 3 accounts whose posts are older than all others | 0.2 ms | | the same |
+| 1 account with 20,000 posts | 9 to 24 ms | 2 to 4 ms | the same |
+| 200 accounts | 10 to 14 ms | 10 ms | `ix_posts_created_at` backwards, probing `follows` per author |
+| 5,000 accounts | 0.4 ms | | the same |
+
+The slowest case is the one with few followed accounts that have very many
+posts, since all of an author's posts from the cursor on are read before the
+newest are kept. An index on `(author_id, created_at DESC, id DESC)` was
+tried and was not used by the planner, so it was not added.
+
 ## Follows
 
 | Endpoint | Access | Purpose |
@@ -491,8 +572,9 @@ back.
 
 Hopsnop has no public and private accounts. There is no privacy setting, so
 every account that is shown can be followed by any other, and anyone can read
-its lists. Following is, for now, also independent of everything about posts:
-it changes neither which posts can be read nor what is in the For You feed.
+its lists. Following does not change which posts can be read, nor what is in
+the For You feed or in a post's replies. It decides what is in the
+[Following feed](#following) and whose [stories](#stories) are shown.
 
 ### Following and unfollowing
 

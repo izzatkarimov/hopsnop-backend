@@ -6,7 +6,7 @@ in ``app.services.posts``, with every other rule about who may see a post.
 
 from fastapi import APIRouter, Depends
 
-from app.api.deps import DbSession, OptionalUser, Pagination, no_store
+from app.api.deps import DbSession, OptionalUser, Pagination, VerifiedUser, no_store
 from app.schemas.post import PostPageResponse, PostResponse
 from app.services import posts as posts_service
 
@@ -27,6 +27,30 @@ def get_for_you_feed(
     it. Whom the caller follows plays no part.
     """
     posts = posts_service.list_for_you_feed(
+        db,
+        viewer,
+        limit=page.limit,
+        after=page.after,
+    )
+    return PostPageResponse(
+        items=[PostResponse.model_validate(post) for post in posts.items],
+        next_cursor=posts.next_cursor,
+    )
+
+
+@router.get("/following", response_model=PostPageResponse)
+def get_following_feed(
+    viewer: VerifiedUser,
+    page: Pagination,
+    db: DbSession,
+) -> PostPageResponse:
+    """Following: the posts of the users the caller follows, newest first,
+    replies included.
+
+    Whose feed it is, is always the signed-in user; there is no way to name
+    another.
+    """
+    posts = posts_service.list_following_feed(
         db,
         viewer,
         limit=page.limit,

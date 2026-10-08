@@ -12,10 +12,11 @@ import uuid
 
 from fastapi import APIRouter, Depends, status
 
-from app.api.deps import DbSession, OptionalUser, VerifiedUser, no_store
+from app.api.deps import DbSession, OptionalUser, Pagination, VerifiedUser, no_store
 from app.schemas.post import (
     CreatePostRequest,
     LikeResponse,
+    PostPageResponse,
     PostResponse,
     RepostResponse,
     UpdatePostRequest,
@@ -55,6 +56,31 @@ def get_post(post_id: uuid.UUID, viewer: OptionalUser, db: DbSession) -> PostRes
     found.
     """
     return PostResponse.model_validate(posts_service.get_post(db, post_id, viewer))
+
+
+@router.get("/{post_id}/replies", response_model=PostPageResponse)
+def list_replies(
+    post_id: uuid.UUID,
+    viewer: OptionalUser,
+    page: Pagination,
+    db: DbSession,
+) -> PostPageResponse:
+    """The replies to a post, newest first. No authentication is needed.
+
+    Only the replies to this post itself, not the replies to those. A post
+    that was deleted, or whose author's account is not shown, is not found.
+    """
+    posts = posts_service.list_replies(
+        db,
+        post_id,
+        viewer,
+        limit=page.limit,
+        after=page.after,
+    )
+    return PostPageResponse(
+        items=[PostResponse.model_validate(post) for post in posts.items],
+        next_cursor=posts.next_cursor,
+    )
 
 
 @router.patch("/{post_id}", response_model=PostResponse)
