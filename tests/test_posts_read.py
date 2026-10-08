@@ -401,7 +401,7 @@ def test_post_shows_the_owner_no_more_than_anyone_else(
     assert keys_in(response.json()).isdisjoint(SENSITIVE_KEYS | ACCOUNT_FIELDS)
     assert alice_account.email not in response.text
     assert alice_account.password_hash not in response.text
-    assert alice_client.cookies.get("hopsnop_session") not in response.text
+    assert alice_client.cookies.get("__Host-hopsnop_session") not in response.text
 
 
 def test_reading_a_post_does_not_read_the_authors_private_columns(

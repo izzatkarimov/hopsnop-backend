@@ -254,7 +254,7 @@ def test_users_posts_need_no_authentication(
     client: TestClient, session: Session, alice_account: User
 ) -> None:
     add_posts(session, alice_account, 2)
-    assert client.cookies.get("hopsnop_session") is None
+    assert client.cookies.get("__Host-hopsnop_session") is None
 
     assert page(client).status_code == 200
 
@@ -884,4 +884,4 @@ def test_listing_exposes_no_account_data(
         )
         assert alice_account.email not in response.text
         assert alice_account.password_hash not in response.text
-        assert alice.cookies.get("hopsnop_session") not in response.text
+        assert alice.cookies.get("__Host-hopsnop_session") not in response.text

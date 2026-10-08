@@ -51,8 +51,8 @@ def _empty_to_none(value: str | None) -> str | None:
     return value or None
 
 
-# The same rule as at registration.
-ProfileDisplayName = Annotated[DisplayName, AfterValidator(_reject_nul)]
+# The same rule as at registration: it is the same type.
+ProfileDisplayName = DisplayName
 # Plain text. A bio that is empty once trimmed is stored as no bio at all.
 Bio = Annotated[
     Annotated[

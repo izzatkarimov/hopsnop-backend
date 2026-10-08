@@ -499,7 +499,7 @@ def test_no_post_response_contains_a_secret(
     assert seen == {200, 201, 204, 400, 401, 403, 404, 409, 422}
 
     session_tokens = [
-        client.cookies.get("hopsnop_session") for client in (alice, bob)
+        client.cookies.get("__Host-hopsnop_session") for client in (alice, bob)
     ]
     token_hashes = session.scalars(select(UserSession.token_hash)).all()
     session_ids = [str(id) for id in session.scalars(select(UserSession.id))]

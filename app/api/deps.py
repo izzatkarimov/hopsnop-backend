@@ -19,6 +19,7 @@ from app.core.pagination import (
 from app.db.session import SessionLocal
 from app.models import User, UserSession
 from app.services import auth as auth_service
+from app.services import rate_limit
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 
@@ -78,8 +79,42 @@ def verify_request_origin(request: Request) -> None:
         )
 
 
+def client_address(request: Request) -> str:
+    """The address a request comes from, as the server sees it.
+
+    Used only to count requests, and only in hashed form (see
+    ``app.services.rate_limit``). It is the peer of the connection. Behind a
+    reverse proxy that is the proxy, unless the server is started so that it
+    takes the address from the proxy's headers (uvicorn's
+    ``--proxy-headers`` and ``--forwarded-allow-ips``). A header that any
+    client can set is deliberately not read here.
+    """
+    return request.client.host if request.client else "unknown"
+
+
+ClientAddress = Annotated[str, Depends(client_address)]
+
+
+def limit_per_address(scope: str, setting: str):
+    """Dependency: count this request against a per-address limit.
+
+    ``setting`` names the setting that holds the limit. It is read on every
+    request, so the limit is whatever is configured at that moment. Every
+    request is counted, whatever its outcome, and before anything else about
+    it is looked at.
+    """
+
+    def count_request(address: ClientAddress, db: DbSession) -> None:
+        rate_limit.count(
+            db,
+            rate_limit.Limit(scope, address, getattr(settings, setting)),
+        )
+
+    return Depends(count_request)
+
+
 def _session_from_cookie(request: Request, db: Session) -> UserSession | None:
-    raw_token = request.cookies.get(settings.session_cookie_name)
+    raw_token = request.cookies.get(settings.session_cookie)
     return auth_service.authenticate_session(db, raw_token) if raw_token else None
 
 

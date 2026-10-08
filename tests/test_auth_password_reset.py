@@ -9,7 +9,15 @@ from app.core.config import settings
 from app.core.security import generate_token, hash_token, verify_password
 from app.models import PasswordResetToken, User, UserSession
 from app.services import auth as auth_service
-from helpers import PASSWORD, add_user, expire, log_in, registration, token_from
+from helpers import (
+    PASSWORD,
+    add_user,
+    expire,
+    let_cooldown_pass,
+    log_in,
+    registration,
+    token_from,
+)
 
 NEW_PASSWORD = "a brand new passphrase"
 INVALID_TOKEN = {"detail": "Invalid or expired password reset token."}
@@ -27,9 +35,16 @@ def reset(client: TestClient, token: str, new_password: str = NEW_PASSWORD):
 
 
 @pytest.fixture
-def raw_token(client: TestClient, alice_account: User, outbox) -> str:
-    """The token from a reset link requested for alice."""
+def raw_token(
+    client: TestClient, session: Session, alice_account: User, outbox
+) -> str:
+    """The token from a reset link requested for alice.
+
+    Issued long enough ago that another link may be asked for; what happens
+    sooner than that is in ``test_rate_limiting.py``.
+    """
     assert forgot(client).status_code == 202
+    let_cooldown_pass(session)
     return token_from(outbox.password_reset[0][1])
 
 

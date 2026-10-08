@@ -5,14 +5,23 @@ cookie, status codes) and ``app.services.auth``, which holds the rules.
 """
 
 import uuid
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
-from app.api.deps import CurrentSession, CurrentUser, DbSession
+from app.api.deps import (
+    ClientAddress,
+    CurrentSession,
+    CurrentUser,
+    DbSession,
+    VerifiedUser,
+    limit_per_address,
+)
 from app.core.config import settings
 from app.schemas.auth import (
     AccountResponse,
+    ChangePasswordRequest,
     ForgotPasswordRequest,
     LoginRequest,
     MessageResponse,
@@ -24,6 +33,7 @@ from app.schemas.auth import (
     VerifyEmailRequest,
 )
 from app.services import auth as auth_service
+from app.services import rate_limit
 from app.services.email import (
     EmailSender,
     email_verification_url,
@@ -43,12 +53,16 @@ router = APIRouter(prefix="/auth", tags=["auth"], dependencies=[Depends(_no_stor
 EmailSenderDep = Annotated[EmailSender, Depends(get_email_sender)]
 
 
-def _set_session_cookie(response: Response, raw_token: str) -> None:
+def _set_session_cookie(
+    response: Response, raw_token: str, *, max_age: int | None = None
+) -> None:
+    if max_age is None:
+        max_age = int(settings.session_lifetime.total_seconds())
     response.set_cookie(
-        key=settings.session_cookie_name,
+        key=settings.session_cookie,
         value=raw_token,
         # The browser drops the cookie when the session expires server-side.
-        max_age=int(settings.session_lifetime.total_seconds()),
+        max_age=max_age,
         path="/",
         # No Domain attribute: the cookie is only sent back to this host.
         httponly=True,
@@ -59,7 +73,7 @@ def _set_session_cookie(response: Response, raw_token: str) -> None:
 
 def _clear_session_cookie(response: Response) -> None:
     response.delete_cookie(
-        key=settings.session_cookie_name,
+        key=settings.session_cookie,
         path="/",
         httponly=True,
         secure=settings.session_cookie_secure,
@@ -70,10 +84,39 @@ def _clear_session_cookie(response: Response) -> None:
 # --- registration and login ----------------------------------------------
 
 
+# --- rate limits ----------------------------------------------------------
+#
+# How often each of these may be asked for is set in ``app.core.config``.
+# Every refusal is the same 429, whichever limit was reached.
+
+
+def _login_limits(identifier: str, address: str) -> list[rate_limit.Limit]:
+    """The three counters of failed logins, narrowest first.
+
+    They are keyed by what was typed, not by the account it may belong to,
+    so they behave the same for an identifier that names no account. A
+    request that one of them refuses counts against none of them, so an
+    address that has used up its own guesses at an account adds nothing
+    more to the account's limit as a whole.
+    """
+    return [
+        rate_limit.Limit(
+            "login:identifier+address",
+            f"{identifier}\x00{address}",
+            settings.login_failures_per_identifier_and_ip,
+        ),
+        rate_limit.Limit("login:address", address, settings.login_failures_per_ip),
+        rate_limit.Limit(
+            "login:identifier", identifier, settings.login_failures_per_identifier
+        ),
+    ]
+
+
 @router.post(
     "/register",
     response_model=AccountResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[limit_per_address("register", "registrations_per_ip")],
 )
 def register(
     data: RegisterRequest,
@@ -99,14 +142,27 @@ def login(
     data: LoginRequest,
     request: Request,
     response: Response,
+    address: ClientAddress,
     db: DbSession,
 ) -> AccountResponse:
-    session, raw_token = auth_service.log_in(
-        db,
-        identifier=data.identifier,
-        password=data.password.get_secret_value(),
-        replaced_token=request.cookies.get(settings.session_cookie_name),
-    )
+    # The attempt is counted first, before the password is looked at. Too
+    # many failures are refused here whatever this password is, without the
+    # cost of checking it; and of several attempts made at once, each is
+    # counted before any of them is checked.
+    counted = rate_limit.count_all(db, _login_limits(data.identifier, address))
+    try:
+        session, raw_token = auth_service.log_in(
+            db,
+            identifier=data.identifier,
+            password=data.password.get_secret_value(),
+            replaced_token=request.cookies.get(settings.session_cookie),
+        )
+    except auth_service.EmailNotVerifiedError:
+        # The password was right, so this was not a guess.
+        rate_limit.uncount_all(db, counted)
+        raise
+    # Only failures are limited: a login that succeeds is not counted.
+    rate_limit.uncount_all(db, counted)
     # The token leaves the server only in this cookie, never in the body.
     _set_session_cookie(response, raw_token)
     return AccountResponse.model_validate(session.user)
@@ -118,7 +174,7 @@ def logout(request: Request, response: Response, db: DbSession) -> None:
 
     Succeeds whether or not the request carried a usable session.
     """
-    raw_token = request.cookies.get(settings.session_cookie_name)
+    raw_token = request.cookies.get(settings.session_cookie)
     if raw_token:
         auth_service.log_out(db, raw_token)
     _clear_session_cookie(response)
@@ -132,7 +188,11 @@ def me(user: CurrentUser) -> AccountResponse:
 # --- email verification --------------------------------------------------
 
 
-@router.post("/verify-email", response_model=MessageResponse)
+@router.post(
+    "/verify-email",
+    response_model=MessageResponse,
+    dependencies=[limit_per_address("verify-email", "token_redemptions_per_ip")],
+)
 def verify_email(data: VerifyEmailRequest, db: DbSession) -> MessageResponse:
     auth_service.verify_email(db, data.token.get_secret_value())
     return MessageResponse(message="Email address verified.")
@@ -142,6 +202,7 @@ def verify_email(data: VerifyEmailRequest, db: DbSession) -> MessageResponse:
     "/resend-verification",
     response_model=MessageResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[limit_per_address("resend-verification", "email_requests_per_ip")],
 )
 def resend_verification(
     data: ResendVerificationRequest,
@@ -154,7 +215,8 @@ def resend_verification(
             to=data.email,
             url=email_verification_url(raw_token),
         )
-    # The same answer whether or not the address belongs to an account.
+    # The same answer whether or not the address belongs to an account, and
+    # whether or not a link was issued too recently for another to be sent.
     return MessageResponse(
         message=(
             "If that email address belongs to an account that still needs "
@@ -170,6 +232,7 @@ def resend_verification(
     "/forgot-password",
     response_model=MessageResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[limit_per_address("forgot-password", "email_requests_per_ip")],
 )
 def forgot_password(
     data: ForgotPasswordRequest,
@@ -182,7 +245,8 @@ def forgot_password(
             to=data.email,
             url=password_reset_url(raw_token),
         )
-    # The same answer whether or not the address belongs to an account.
+    # The same answer whether or not the address belongs to an account, and
+    # whether or not a link was issued too recently for another to be sent.
     return MessageResponse(
         message=(
             "If that email address belongs to an account, a password reset "
@@ -191,7 +255,11 @@ def forgot_password(
     )
 
 
-@router.post("/reset-password", response_model=MessageResponse)
+@router.post(
+    "/reset-password",
+    response_model=MessageResponse,
+    dependencies=[limit_per_address("reset-password", "token_redemptions_per_ip")],
+)
 def reset_password(data: ResetPasswordRequest, db: DbSession) -> MessageResponse:
     auth_service.reset_password(
         db,
@@ -199,6 +267,50 @@ def reset_password(data: ResetPasswordRequest, db: DbSession) -> MessageResponse
         data.new_password.get_secret_value(),
     )
     return MessageResponse(message="Password has been reset.")
+
+
+# --- password change -----------------------------------------------------
+
+
+@router.post("/change-password", response_model=MessageResponse)
+def change_password(
+    data: ChangePasswordRequest,
+    current: CurrentSession,
+    # Named for what it requires. The user is the session's.
+    _verified: VerifiedUser,
+    response: Response,
+    db: DbSession,
+) -> MessageResponse:
+    """Sets a new password for the signed-in user, who must know the old one.
+
+    Every other session of the user is ended. This one continues, under a
+    new cookie.
+    """
+    # A session alone must not be enough to find out the password by trying:
+    # wrong current passwords are limited per account, like failed logins.
+    limits = [
+        rate_limit.Limit(
+            "change-password:account",
+            str(current.user_id),
+            settings.password_change_failures,
+        )
+    ]
+    counted = rate_limit.count_all(db, limits)
+    # Read before the change commits, which expires what the session holds.
+    remaining = current.expires_at - datetime.now(timezone.utc)
+    raw_token = auth_service.change_password(
+        db,
+        current,
+        current_password=data.current_password.get_secret_value(),
+        new_password=data.new_password.get_secret_value(),
+    )
+    rate_limit.uncount_all(db, counted)
+    # The session ends when it would have: the cookie is given the time that
+    # is left, not a new lifetime.
+    _set_session_cookie(
+        response, raw_token, max_age=max(1, int(remaining.total_seconds()))
+    )
+    return MessageResponse(message="Password has been changed.")
 
 
 # --- session management --------------------------------------------------

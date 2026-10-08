@@ -92,11 +92,18 @@ def test_token_hash_is_deterministic_and_not_the_token() -> None:
 # --- configuration -------------------------------------------------------
 
 
+PRODUCTION_SECRET = "a-rate-limit-secret-of-sufficient-length"
+
+
 def make_settings(monkeypatch: pytest.MonkeyPatch, **values: object) -> Settings:
     """Settings built from the given values only, ignoring .env and the shell."""
     for name in Settings.model_fields:
         monkeypatch.delenv(name.upper(), raising=False)
     values.setdefault("database_url", "postgresql+psycopg://unused")
+    if values.get("environment", "production") == "production":
+        # What production cannot start without; see the tests further down.
+        values.setdefault("frontend_url", "https://app.hopsnop.example")
+        values.setdefault("rate_limit_secret", PRODUCTION_SECRET)
     return Settings(_env_file=None, **values)
 
 
@@ -167,6 +174,8 @@ def test_settings_are_read_from_the_environment(
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://unused")
     monkeypatch.setenv("SESSION_LIFETIME_DAYS", "3")
     monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.delenv("FRONTEND_URL", raising=False)
+    monkeypatch.delenv("RATE_LIMIT_SECRET", raising=False)
 
     settings = Settings(_env_file=None)
 

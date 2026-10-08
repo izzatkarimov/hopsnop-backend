@@ -49,22 +49,48 @@ defined.
 | --- | --- | --- |
 | `DATABASE_URL` | required | SQLAlchemy URL of the PostgreSQL database |
 | `ENVIRONMENT` | `production` | `development` or `production`, see below |
-| `FRONTEND_URL` | `http://localhost:3000` | Base of emailed links; the only other origin allowed to call the API from a browser |
-| `SESSION_COOKIE_NAME` | `hopsnop_session` | Name of the session cookie |
+| `FRONTEND_URL` | development only: `http://localhost:3000` | Base of emailed links; the only other origin allowed to call the API from a browser |
+| `RATE_LIMIT_SECRET` | development only | Key of the hashes that rate-limit counters are stored under |
+| `SESSION_COOKIE_NAME` | `hopsnop_session` | Name of the session cookie, before its `__Host-` prefix |
 | `SESSION_COOKIE_SAMESITE` | `lax` | `lax` or `strict`; `none` is not accepted |
 | `SESSION_LIFETIME_DAYS` | `30` | How long a session lasts after login |
 | `SESSION_LAST_USED_INTERVAL_SECONDS` | `300` | Minimum time between writes of `sessions.last_used_at` |
 | `EMAIL_VERIFICATION_TOKEN_LIFETIME_HOURS` | `24` | Validity of a verification link |
 | `PASSWORD_RESET_TOKEN_LIFETIME_MINUTES` | `30` | Validity of a password reset link |
 | `PASSWORD_MIN_LENGTH` | `12` | Minimum password length (cannot be set below 8) |
+| `MAX_REQUEST_BODY_BYTES` | `65536` | Largest request body that is read |
+
+The limits of [rate limiting](#rate-limiting) are settings as well and are
+listed there.
 
 `ENVIRONMENT` defaults to `production` so that a deployment which forgets to
-set it gets the strict behaviour. `development` changes exactly two things:
+set it gets the strict behaviour. `development` changes these things and no
+others:
 
-- the session cookie is sent without `Secure`, because browsers do not return
-  `Secure` cookies over plain HTTP;
+- the session cookie is sent without `Secure` and without the `__Host-`
+  prefix, because browsers do not return `Secure` cookies over plain HTTP;
 - verification and password reset links are written to the server log instead
-  of being emailed.
+  of being emailed;
+- `FRONTEND_URL` and `RATE_LIMIT_SECRET` have defaults;
+- the interactive API documentation is served.
+
+### Production
+
+A production does not start unless it is configured safely. The settings are
+checked once, when the application is loaded, and it fails there if
+
+- `FRONTEND_URL` is not set, or is not an `https` URL. That origin is trusted
+  with credentialed requests, so there is no fallback to `localhost`;
+- `RATE_LIMIT_SECRET` is not set, is shorter than 32 characters, or is the
+  development value.
+
+`/docs`, `/redoc` and `/openapi.json` are not served in production (`404`).
+
+Three things are left to the deployment, because this application cannot do
+them properly: TLS and the `Strict-Transport-Security` header belong to
+whatever terminates TLS; the Content-Security-Policy of the pages belongs to
+the frontend; and the server has to be told the client's address by the proxy
+in front of it (see [rate limiting](#rate-limiting)).
 
 ## Authentication
 
@@ -81,6 +107,7 @@ nothing for frontend JavaScript to store.
 | `GET /auth/me` | The authenticated user |
 | `POST /auth/forgot-password` | Send a password reset link |
 | `POST /auth/reset-password` | Redeem a reset token and set a new password |
+| `POST /auth/change-password` | Set a new password, knowing the current one |
 | `GET /auth/sessions` | The user's active sessions |
 | `DELETE /auth/sessions/{id}` | Revoke one of the user's sessions |
 | `POST /auth/sessions/revoke-others` | Revoke every session except the current one |
@@ -99,6 +126,28 @@ Passwords are hashed with Argon2id (`argon2-cffi`, RFC 9106 parameters), with a
 random salt per hash. The only policy is a length between `PASSWORD_MIN_LENGTH`
 and 128 characters. Hashes made with older parameters are upgraded at the next
 successful login.
+
+`POST /auth/change-password` takes `current_password` and `new_password` from
+a signed-in, verified user. A wrong current password is a `400`, and such
+failures are limited per account like failed logins. On success:
+
+- the new password is hashed afresh and the old one stops working;
+- every other session of the user is revoked;
+- the current session continues, but under a new token, sent in a new cookie.
+  A copy of the old cookie is therefore worth nothing either. The session
+  keeps its id and its expiry;
+- a password reset link that is still outstanding is withdrawn.
+
+A login, a password change and a password reset for one account pass through
+a lock on the account's row, one at a time. A login checks the password
+first, which takes a while, and then takes the lock and reads the stored hash
+again: if the password was changed or reset in the meantime it is refused
+like any wrong password, and no session is created. A login that got there
+first is waited for, and its session is ended with the others. Either way no
+session that was opened with the old password is left once the change or
+reset is done. Two changes of the same password at once cannot both take
+effect for the same reason: the second finds that the password it proved is
+no longer the current one.
 
 ### Sessions and tokens
 
@@ -121,21 +170,29 @@ the database. Using a session does not extend its expiry.
 
 Verification and reset tokens are single-use and expire. Issuing a new one
 deletes the user's previous unused one, so only the latest link works and
-`used_at` always means the token was redeemed.
+`used_at` always means the token was redeemed. A new one is not issued within
+`EMAIL_TOKEN_COOLDOWN_SECONDS` of the last (see
+[rate limiting](#rate-limiting)).
 
 ### Account enumeration
 
 Login gives the same `401` for an unknown account, a wrong password and a
 deactivated account, and verifies a dummy hash when the account does not exist
 so that timing does not distinguish the cases either. `resend-verification` and
-`forgot-password` always answer `202` with the same body. Registration does
-report a username or email that is already taken.
+`forgot-password` always answer `202` with the same body, also within the
+cooldown on links. Registration does report a username or email that is
+already taken. It is limited per address, which slows such questions down but
+does not prevent them; answering every registration alike needs working
+email first and is deferred.
 
 ### Cookie and CSRF
 
 The cookie is `HttpOnly`, `SameSite=Lax`, `Path=/`, host-only (no `Domain`), and
-`Secure` outside development. Because a cookie is attached automatically,
-`HttpOnly` does nothing against CSRF; three things do:
+`Secure` outside development. Outside development its name carries the
+`__Host-` prefix (`__Host-hopsnop_session`). Browsers accept a cookie of such a
+name only with exactly those attributes, so another host of the same site
+cannot plant a session cookie for this one. Because a cookie is attached
+automatically, `HttpOnly` does nothing against CSRF; three things do:
 
 1. `SameSite=Lax`: the browser does not attach the cookie to cross-site `POST`
    or `DELETE` requests.
@@ -156,6 +213,114 @@ CSRF token would have to be added first.
 When the API runs behind a TLS-terminating proxy, the server must be told the
 original scheme (uvicorn's `--proxy-headers` and `--forwarded-allow-ips`), or
 same-origin requests such as those from `/docs` are rejected.
+
+### Rate limiting
+
+The endpoints that check a secret or send an email are rate limited. A request
+over a limit is answered with `429` and a `Retry-After` header, the same
+answer whichever limit it was. The header is exposed to the frontend
+(`Access-Control-Expose-Headers`), so its scripts can read it.
+
+| Endpoint | Counted | Per | Setting | Default |
+| --- | --- | --- | --- | --- |
+| `POST /auth/login` | failures | identifier and address | `LOGIN_FAILURES_PER_IDENTIFIER_AND_IP` | 5 |
+| | failures | identifier | `LOGIN_FAILURES_PER_IDENTIFIER` | 20 |
+| | failures | address | `LOGIN_FAILURES_PER_IP` | 30 |
+| `POST /auth/change-password` | failures | account | `PASSWORD_CHANGE_FAILURES` | 5 |
+| `POST /auth/register` | requests | address | `REGISTRATIONS_PER_IP` | 5 |
+| `POST /auth/forgot-password`, `/auth/resend-verification` | requests | address | `EMAIL_REQUESTS_PER_IP` | 5 each |
+| `POST /auth/verify-email`, `/auth/reset-password` | requests | address | `TOKEN_REDEMPTIONS_PER_IP` | 10 each |
+
+All of them count within one window, `RATE_LIMIT_WINDOW_MINUTES` (15). A
+window starts with the first request counted and ends that long after;
+being refused does not extend it.
+
+A login attempt takes a place in each counter before the password is looked
+at, and gives the places back if the login succeeds. So a right password is
+refused as well while a limit is reached, no password is hashed for a refused
+request, and attempts made at the same moment cannot outnumber the limit. A
+request that finds a counter full takes no place in any of them: what the
+counters hold are wrong passwords, and attempts still under way. For that
+last reason more simultaneous attempts than a counter has places are refused
+for the moment, whatever they would have turned out to be, and leave nothing
+behind.
+
+The counters are keyed by the identifier as typed, so an identifier that
+names no account is limited exactly like one that does, and a username and
+an email address of one account are counted apart.
+
+One address is stopped after 5 failures for an account, and from then on adds
+nothing to that account's limit of 20, which is there for guesses spread over
+several addresses. The windows of the two counters are not aligned, so an
+address can fit the end of one of its windows and the start of the next into
+a single window of the account: up to 10 failures, not 5. That is why
+`LOGIN_FAILURES_PER_IDENTIFIER` must be at least three times
+`LOGIN_FAILURES_PER_IDENTIFIER_AND_IP`; the application does not start
+otherwise. One address can therefore never lock an account's owner out. Two
+or more can, for the rest of the window. That is the price of limiting such
+an attack at all.
+
+**Emailed links.** Besides the limit per address, a verification or reset
+link is not replaced within `EMAIL_TOKEN_COOLDOWN_SECONDS` (300) of being
+issued: the request is answered with the usual `202`, but no new token is
+made and the link already sent stays valid. Without this, anyone who knows an
+address could keep its owner's link from ever working by asking again, and
+could fill the inbox while at it. The cooldown is read from the tokens
+themselves, so no email address is ever stored for it. Requests for one
+account are serialized by a lock on its row, so requests arriving at the
+same moment issue one link between them, not one each. Redeeming a link
+takes the same lock, and takes it before the token's own, which is the order
+a request for a new link takes them in: the two cannot deadlock.
+
+**Storage.** The counters are rows in the `rate_limits` table (PostgreSQL, no
+Redis and nothing in memory), so they are shared by every worker process and
+survive a restart. A row holds a key, the start of its window and a count.
+The key is an HMAC-SHA256, under `RATE_LIMIT_SECRET`, of which limit it is
+and for whom: no address and no identifier is stored, and without the secret
+a row cannot be tested against a guess. Counting is a single
+`INSERT ... ON CONFLICT DO UPDATE ... WHERE ... RETURNING`, which PostgreSQL
+serializes per row: it takes a place if one is free and takes nothing if
+none is, so a counter never exceeds its limit. It is committed on its own,
+on the request's database session, which is why it is only called where that
+session holds no other changes. A place is given back only in the window it
+was taken in. There is one row per key, reused from window to window; rows
+of keys that are never seen again are not removed yet.
+
+**The client's address** is the peer of the connection. Behind a reverse
+proxy the server must be started so that it takes the address from the proxy
+(uvicorn's `--proxy-headers` with `--forwarded-allow-ips` set to the proxy),
+or every client shares one address and its limits. Forwarding headers are
+never read from clients directly.
+
+### Requests and responses
+
+A request body larger than `MAX_REQUEST_BODY_BYTES` (64 KiB) is refused with
+`413` before it reaches validation or a password hash, whether or not it
+declares its length. A declared length is only taken at its word when the
+request has no `Transfer-Encoding`; with one, the body is measured as it
+arrives. The largest body the API takes is a few kilobytes.
+
+Every response carries `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`,
+`Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` and,
+unless the route set its own, `Cache-Control: no-store`, errors included.
+
+A display name is 1 to 50 characters of any script. Two rules keep it from
+showing as something it is not, at registration and in the profile alike
+(`422` otherwise):
+
+- It must contain at least one letter, number, punctuation mark or symbol.
+  Combining marks, variation selectors and spaces are allowed beside those
+  but do not make a name by themselves.
+- It must not contain control characters (NUL among them), zero-width and
+  other format characters, direction overrides, line separators, private-use
+  or unassigned characters, or the blank Hangul and Braille characters. The
+  zero-width joiner and non-joiner are the exception, where they join:
+  between two non-ASCII characters, as Persian and emoji sequences need.
+
+Which characters are assigned is what the Python in use knows of Unicode, so
+a character newer than that is refused until Python is. Look-alike letters of
+different scripts are not detected, and display names are not unique.
 
 ### Email
 
@@ -804,6 +969,10 @@ pytest
 
 The tests use the database from `DATABASE_URL` and need the migrations applied.
 Each test runs in a transaction that is rolled back, so nothing is committed.
+The exception is the tests of what happens when requests arrive together
+(the last part of `test_rate_limiting.py`, and `test_auth_concurrency.py`).
+They need real transactions: they commit accounts and counters under random
+names and delete them again.
 The API tests run the application inside that same transaction and always use
 the production settings, whatever `ENVIRONMENT` is set to locally.
 

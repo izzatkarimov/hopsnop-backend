@@ -714,7 +714,7 @@ def test_no_follow_response_contains_a_secret(
     carol = session.scalars(select(User).where(User.username == "carol")).one()
     add_hidden_accounts(session, alice_account, bob_account)
     session_tokens = [
-        client.cookies.get("hopsnop_session") for client in (alice, bob)
+        client.cookies.get("__Host-hopsnop_session") for client in (alice, bob)
     ]
     responses = []
 

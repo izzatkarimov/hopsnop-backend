@@ -10,8 +10,15 @@ is replaced with the test's session, so requests made through ``client`` see
 the test's data and their writes are rolled back with everything else.
 """
 
+import os
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
+
+# The settings are read when the application is imported, below, and a
+# production without its required settings does not load at all. The tests
+# need no deployment's configuration: they load as a development setup and
+# then switch to the production behaviour themselves (``_production_settings``).
+os.environ.setdefault("ENVIRONMENT", "development")
 
 import pytest
 from fastapi.testclient import TestClient

@@ -333,7 +333,7 @@ def test_no_feed_response_contains_a_secret(
     add_post(session, carol, "Hidden: not verified yet")
     add_hidden_posts(session)
     session_tokens = [
-        client.cookies.get("hopsnop_session") for client in (alice, bob)
+        client.cookies.get("__Host-hopsnop_session") for client in (alice, bob)
     ]
 
     responses = []

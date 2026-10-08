@@ -378,7 +378,7 @@ def test_no_following_feed_response_contains_a_secret(
     add_post(session, carol, "Hidden: not followed")
     add_post(session, alice_account, "Hidden: deleted", deleted=True)
     session_tokens = [
-        client.cookies.get("hopsnop_session") for client in (alice, bob)
+        client.cookies.get("__Host-hopsnop_session") for client in (alice, bob)
     ]
 
     responses = []

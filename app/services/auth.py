@@ -13,7 +13,7 @@ and not logged.
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import Select, delete, exists, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager
 
@@ -62,6 +62,12 @@ class InvalidVerificationTokenError(AuthError):
 
 class InvalidPasswordResetTokenError(AuthError):
     detail = "Invalid or expired password reset token."
+
+
+class WrongCurrentPasswordError(AuthError):
+    # Not a 401: the session is fine, and a client must not take this for
+    # having been logged out.
+    detail = "Current password is incorrect."
 
 
 def _now() -> datetime:
@@ -163,6 +169,19 @@ def log_in(
     # someone who does not already hold the credentials.
     if user.email_verified_at is None:
         raise EmailNotVerifiedError
+
+    # Checking the password took a while, and it was checked against the
+    # hash as it was read before that. The password may have been changed or
+    # reset in the meantime, with every session ended. So the account is
+    # locked now and its hash read again: if it is not the one that was
+    # checked, what was proven is a password the account no longer has, and
+    # no session comes of it. The session is created under the same lock. A
+    # change or reset that comes after it waits for it to be committed and
+    # then ends it with the others.
+    verified_hash = user.password_hash
+    account = _lock_account(db, user.id)
+    if account is None or account.password_hash != verified_hash:
+        raise InvalidCredentialsError
 
     now = _now()
     if password_needs_rehash(user.password_hash):
@@ -302,8 +321,10 @@ def request_email_verification(db: Session, email: str) -> str | None:
     Returns the raw token, or None if there is nothing to send. The caller
     must respond identically in both cases.
     """
-    user = db.scalar(select(User).where(User.email == email))
+    user = db.scalar(_for_issuing_a_token(email))
     if user is None or not user.is_active or user.email_verified_at is not None:
+        return None
+    if _issued_recently(db, EmailVerificationToken, user):
         return None
     raw_token = _issue_token(
         db,
@@ -324,8 +345,10 @@ def request_password_reset(db: Session, email: str) -> str | None:
     Returns the raw token, or None if there is nothing to send. The caller
     must respond identically in both cases.
     """
-    user = db.scalar(select(User).where(User.email == email))
+    user = db.scalar(_for_issuing_a_token(email))
     if user is None or not user.is_active:
+        return None
+    if _issued_recently(db, PasswordResetToken, user):
         return None
     raw_token = _issue_token(
         db,
@@ -340,6 +363,9 @@ def request_password_reset(db: Session, email: str) -> str | None:
 def reset_password(db: Session, raw_token: str, new_password: str) -> None:
     """Redeem a reset token: set the new password and end every session."""
     now = _now()
+    # The account is locked from here on (``_usable_token``), which is what
+    # a login waits for: none can slip a session in between the sessions
+    # being ended below and the new password taking effect.
     token = _usable_token(db, PasswordResetToken, raw_token, now)
     if token is None:
         raise InvalidPasswordResetTokenError
@@ -356,6 +382,71 @@ def reset_password(db: Session, raw_token: str, new_password: str) -> None:
         .values(revoked_at=now)
     )
     db.commit()
+
+
+# --- password change -----------------------------------------------------
+
+
+def change_password(
+    db: Session,
+    current: UserSession,
+    *,
+    current_password: str,
+    new_password: str,
+) -> str:
+    """Replace the password of the session's user, who must know the old one.
+
+    Returns the new raw token of the current session, which goes into the
+    cookie.
+
+    Afterwards the new password is the only way in, as after a reset. Every
+    other session of the user is ended. The current one stays, but under a
+    new token: whoever else held a copy of the old cookie is logged out with
+    the rest. The session is the same one otherwise. Its id is kept, and it
+    expires when it would have.
+
+    A reset link that is still outstanding is withdrawn as well. It was
+    asked for under the old password and should not outlive it.
+    """
+    user = current.user
+    verified_hash = user.password_hash
+    if not verify_password(current_password, verified_hash):
+        raise WrongCurrentPasswordError
+    # A new hash with a new salt, under the current Argon2 parameters. Made
+    # before the account is locked, so the lock is not held for as long as
+    # hashing takes.
+    new_hash = hash_password(new_password)
+
+    # From here on the account is locked: no login can open a session, and
+    # no other change or reset can take place, until this one is committed.
+    # As in ``log_in``, the hash is read again under the lock. If it is not
+    # the one the current password was checked against, the password was
+    # changed or reset in the meantime, and the one that was proven here is
+    # not the current password any more.
+    account = _lock_account(db, user.id)
+    if account is None or account.password_hash != verified_hash:
+        raise WrongCurrentPasswordError
+
+    now = _now()
+    user.password_hash = new_hash
+    raw_token = generate_token()
+    current.token_hash = hash_token(raw_token)
+    db.execute(
+        update(UserSession)
+        .where(
+            UserSession.id != current.id,
+            *_active_sessions_of(user.id, now),
+        )
+        .values(revoked_at=now)
+    )
+    db.execute(
+        delete(PasswordResetToken).where(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.used_at.is_(None),
+        )
+    )
+    db.commit()
+    return raw_token
 
 
 # --- single-use tokens ---------------------------------------------------
@@ -390,6 +481,72 @@ def _issue_token(
     return raw_token
 
 
+def _lock_account(db: Session, user_id: uuid.UUID) -> User | None:
+    """The account as it is now, its row locked until the transaction ends.
+
+    The row is what a login, a password change, a password reset and the
+    handling of emailed links for one account all pass through, one at a
+    time. Whoever comes second waits for the first to commit and then sees
+    what the first has done: this reads the row again once the lock is
+    held, and the account that is already loaded in the session is brought
+    up to date with it.
+
+    Wherever an account and its tokens or sessions are both locked, the
+    account is locked first. Nothing takes them in the other order, so no
+    two requests can each hold what the other is waiting for.
+
+    The lock is FOR NO KEY UPDATE, the same that ``_for_issuing_a_token``
+    takes. It does not hold up anything that only refers to the account,
+    such as a post being written by it.
+    """
+    return db.scalar(
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update(key_share=True)
+        .execution_options(populate_existing=True)
+    )
+
+
+def _for_issuing_a_token(email: str) -> Select[tuple[User]]:
+    """The account with this address, locked until the transaction ends.
+
+    Asking whether a link was issued a moment ago and then issuing one are
+    two steps. The lock makes them one for the account: of several requests
+    for the same address arriving at once, the second waits for the first to
+    commit and then finds the link the first has issued, so it issues none
+    and withdraws none.
+
+    The lock is the weakest that requests take against each other (FOR NO
+    KEY UPDATE). It does not hold up anything that only refers to the
+    account, such as a session being created for it.
+    """
+    return select(User).where(User.email == email).with_for_update(key_share=True)
+
+
+def _issued_recently(db: Session, model: _TokenModel, user: User) -> bool:
+    """Does the user hold a link of this kind that was issued a moment ago?
+
+    If so, asking for another is not acted on: no new token is made, and the
+    one in the user's inbox is left as it is. Without this, anyone who knows
+    an address could keep the owner's link from ever working by asking for a
+    new one again and again, and could fill the inbox while at it.
+
+    The cooldown is read from the tokens themselves. Nothing else has to be
+    stored for it, and it cannot outlast the token it protects.
+    """
+    now = _now()
+    return db.scalar(
+        select(
+            exists().where(
+                model.user_id == user.id,
+                model.used_at.is_(None),
+                model.expires_at > now,
+                model.created_at > now - settings.email_token_cooldown,
+            )
+        )
+    )
+
+
 def _usable_token(
     db: Session,
     model: _TokenModel,
@@ -401,13 +558,26 @@ def _usable_token(
     The row is locked until the transaction ends. If two requests present the
     same token at once, the second waits for the first, then finds the token
     already used and gets nothing, so a token can never be redeemed twice.
+
+    The account the token belongs to is locked before the token is, and
+    stays locked as long. That is the order in which a request for a new
+    link takes the two (the account, then the old token it withdraws), so
+    redeeming a link and asking for another cannot block each other for
+    good. It is also what makes a password reset wait for a login that is
+    creating a session, and a login wait for a reset.
     """
+    token_hash = hash_token(raw_token)
+    # Read without a lock, only to learn which account to lock. Whether the
+    # token may be used is decided below, once both are locked.
+    user_id = db.scalar(select(model.user_id).where(model.token_hash == token_hash))
+    if user_id is None or _lock_account(db, user_id) is None:
+        return None
     return db.scalar(
         select(model)
         .join(model.user)
         .options(contains_eager(model.user))
         .where(
-            model.token_hash == hash_token(raw_token),
+            model.token_hash == token_hash,
             model.used_at.is_(None),
             model.expires_at > now,
             User.is_active.is_(True),

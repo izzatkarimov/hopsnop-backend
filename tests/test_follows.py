@@ -773,7 +773,7 @@ def test_anonymous_caller_follows_nobody(
     response = status(client, "alice")
 
     # Not refused: the answer is public, and for nobody in particular it is no.
-    assert client.cookies.get("hopsnop_session") is None
+    assert client.cookies.get("__Host-hopsnop_session") is None
     assert response.status_code == 200
     assert response.json() == NOT_FOLLOWING
 

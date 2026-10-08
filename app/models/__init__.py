@@ -9,6 +9,7 @@ from app.models.follow import Follow
 from app.models.like import Like
 from app.models.password_reset_token import PasswordResetToken
 from app.models.post import Post
+from app.models.rate_limit import RateLimit
 from app.models.repost import Repost
 from app.models.story import Story
 from app.models.story_view import StoryView
@@ -21,6 +22,7 @@ __all__ = [
     "Like",
     "PasswordResetToken",
     "Post",
+    "RateLimit",
     "Repost",
     "Story",
     "StoryView",

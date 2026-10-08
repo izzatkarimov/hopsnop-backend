@@ -8,13 +8,20 @@ from urllib.parse import parse_qs, urlsplit
 
 from fastapi.testclient import TestClient
 from httpx import Response
-from sqlalchemy import event, select
+from sqlalchemy import event, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.security import hash_password
 from app.db.session import engine
-from app.models import Follow, Post, Story, User
+from app.models import (
+    EmailVerificationToken,
+    Follow,
+    PasswordResetToken,
+    Post,
+    Story,
+    User,
+)
 
 PASSWORD = "correct horse battery staple"
 # Hashed once: Argon2 is slow by design, and most tests only need an account
@@ -102,6 +109,18 @@ def add_story(
     return story
 
 
+def let_cooldown_pass(session: Session) -> None:
+    """Make every outstanding emailed link as old as the cooldown and a bit.
+
+    After this another link can be requested for the same account. Only the
+    time of issue is moved; the links expire when they would have.
+    """
+    age = timedelta(seconds=settings.email_token_cooldown_seconds + 1)
+    for model in (EmailVerificationToken, PasswordResetToken):
+        session.execute(update(model).values(created_at=model.created_at - age))
+    session.flush()
+
+
 def post_columns(session: Session, post_id: object) -> dict[str, object]:
     """Every column of a post's row, as currently stored.
 
@@ -135,7 +154,7 @@ def log_in(
 
 def session_token(client: TestClient) -> str | None:
     """The raw session token the client currently holds in its cookie jar."""
-    return client.cookies.get(settings.session_cookie_name)
+    return client.cookies.get(settings.session_cookie)
 
 
 def plant_session_cookie(client: TestClient, value: str) -> None:
@@ -143,7 +162,7 @@ def plant_session_cookie(client: TestClient, value: str) -> None:
     # The domain and path are the ones the jar records for cookies the test
     # server sets, so a later Set-Cookie replaces this cookie.
     client.cookies.set(
-        settings.session_cookie_name,
+        settings.session_cookie,
         value,
         domain="testserver.local",
         path="/",
@@ -154,7 +173,7 @@ def set_cookie(response: Response) -> Morsel:
     """The session cookie as set by a response, with its attributes."""
     cookie = SimpleCookie()
     cookie.load(response.headers["set-cookie"])
-    return cookie[settings.session_cookie_name]
+    return cookie[settings.session_cookie]
 
 
 def token_from(url: str) -> str:

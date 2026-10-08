@@ -65,7 +65,7 @@ def test_profile_without_bio_or_avatar_returns_nulls(
 def test_public_profile_needs_no_authentication(
     client: TestClient, alice_account: User
 ) -> None:
-    assert client.cookies.get("hopsnop_session") is None
+    assert client.cookies.get("__Host-hopsnop_session") is None
 
     assert client.get("/users/alice").status_code == 200
 

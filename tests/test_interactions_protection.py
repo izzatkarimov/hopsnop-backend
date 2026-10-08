@@ -591,7 +591,7 @@ def test_no_interaction_response_contains_a_secret(
     post = add_post(session, alice_account, "Hello Hopsnop!")
     hidden = hidden_posts(session)
     session_tokens = [
-        client.cookies.get("hopsnop_session") for client in (alice, bob)
+        client.cookies.get("__Host-hopsnop_session") for client in (alice, bob)
     ]
     responses = []
 

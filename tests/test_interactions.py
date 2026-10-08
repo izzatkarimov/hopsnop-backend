@@ -624,7 +624,7 @@ def test_anonymous_reader_gets_the_counts_and_no_interactions_of_their_own(
 
     item = read(client, where, post.id)
 
-    assert client.cookies.get("hopsnop_session") is None
+    assert client.cookies.get("__Host-hopsnop_session") is None
     assert item[kind.count] == 3
     assert item[kind.by_me] is False
     assert item[other(kind).count] == 0

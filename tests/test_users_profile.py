@@ -60,7 +60,7 @@ def test_own_profile_contains_exactly_the_intended_fields(
     assert set(response.json()) == MY_FIELDS
     assert keys_in(response.json()).isdisjoint(SENSITIVE_KEYS)
     assert alice_account.password_hash not in response.text
-    assert alice_client.cookies.get("hopsnop_session") not in response.text
+    assert alice_client.cookies.get("__Host-hopsnop_session") not in response.text
 
 
 def test_own_profile_is_not_to_be_cached(alice_client: TestClient) -> None:

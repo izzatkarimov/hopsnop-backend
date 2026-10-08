@@ -9,15 +9,27 @@ from app.core.config import settings
 from app.core.security import generate_token, hash_token
 from app.models import EmailVerificationToken, User, UserSession
 from app.services import auth as auth_service
-from helpers import add_user, expire, log_in, registration, token_from
+from helpers import (
+    add_user,
+    expire,
+    let_cooldown_pass,
+    log_in,
+    registration,
+    token_from,
+)
 
 INVALID_TOKEN = {"detail": "Invalid or expired verification token."}
 
 
 @pytest.fixture
-def raw_token(client: TestClient, outbox) -> str:
-    """The token from the verification link of a freshly registered alice."""
+def raw_token(client: TestClient, session: Session, outbox) -> str:
+    """The token from the verification link of a newly registered alice.
+
+    Issued long enough ago that another link may be asked for; what happens
+    sooner than that is in ``test_rate_limiting.py``.
+    """
     assert client.post("/auth/register", json=registration()).status_code == 201
+    let_cooldown_pass(session)
     return token_from(outbox.verification[0][1])
 
 
@@ -210,7 +222,9 @@ def test_only_one_verification_token_is_kept_per_user(
 ) -> None:
     for _ in range(3):
         resend(client)
+        let_cooldown_pass(session)
 
+    assert len(outbox.verification) == 4
     newest = token_from(outbox.verification[-1][1])
     assert session.scalars(select(EmailVerificationToken.token_hash)).all() == [
         hash_token(newest)

@@ -25,6 +25,7 @@ from helpers import (
     PASSWORD,
     SENSITIVE_KEYS,
     keys_in,
+    let_cooldown_pass,
     log_in,
     registration,
     session_token,
@@ -283,6 +284,7 @@ def test_no_response_contains_a_secret(
     call(client, "POST", "/auth/register", **registration())  # conflict
     call(client, "POST", "/auth/register", **registration(password="short"))
     call(client, "POST", login, identifier="alice", password=PASSWORD)  # unverified
+    let_cooldown_pass(session)
     call(client, "POST", "/auth/resend-verification", email="alice@example.com")
     verification_tokens = [token_from(url) for _, url in outbox.verification]
     call(client, "POST", "/auth/verify-email", token=verification_tokens[0])
@@ -410,6 +412,7 @@ def test_raw_tokens_and_passwords_do_not_appear_in_logs(
 
     client.post("/auth/register", json=registration())
     verification_token = generated[0]
+    let_cooldown_pass(session)
     client.post("/auth/resend-verification", json={"email": "alice@example.com"})
     client.post("/auth/verify-email", json={"token": verification_token})  # superseded
     client.post("/auth/verify-email", json={"token": generated[1]})

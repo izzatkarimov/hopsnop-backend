@@ -159,7 +159,7 @@ def test_feed_needs_no_authentication(
     client: TestClient, session: Session, alice_account: User
 ) -> None:
     posts = add_posts(session, 2, alice_account)
-    assert client.cookies.get("hopsnop_session") is None
+    assert client.cookies.get("__Host-hopsnop_session") is None
 
     response = feed(client)
 

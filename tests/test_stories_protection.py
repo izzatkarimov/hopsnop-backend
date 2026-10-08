@@ -358,7 +358,7 @@ def test_no_story_response_contains_a_secret_or_a_viewer(
     call(bob, "GET", "/stories?cursor=abc")  # 400
     call(bob, "GET", "/stories?limit=0")  # 422
     # A secret sent in is not sent back either.
-    call(bob, "GET", f"/stories/{bob.cookies.get('hopsnop_session')}")  # 422
+    call(bob, "GET", f"/stories/{bob.cookies.get('__Host-hopsnop_session')}")  # 422
     call(bob, "PATCH", own, json={"caption": "Hacked"})  # 405
     call(bob, "DELETE", own)  # 403
     call(bob, "DELETE", f"/stories/{hidden.id}")  # 404
@@ -369,7 +369,7 @@ def test_no_story_response_contains_a_secret_or_a_viewer(
     seen = {response.status_code for response in responses}
     assert seen == {200, 201, 204, 400, 401, 403, 404, 405, 422}
 
-    session_tokens = [client.cookies.get("hopsnop_session") for client in (alice, bob)]
+    session_tokens = [client.cookies.get("__Host-hopsnop_session") for client in (alice, bob)]
     token_hashes = session.scalars(select(UserSession.token_hash)).all()
     session_ids = [str(id) for id in session.scalars(select(UserSession.id))]
     secrets = [

@@ -381,7 +381,7 @@ def test_no_profile_response_contains_a_secret(
 ) -> None:
     alice, anonymous = make_client(), make_client()
     log_in(alice, "alice")
-    session_token = alice.cookies.get("hopsnop_session")
+    session_token = alice.cookies.get("__Host-hopsnop_session")
 
     responses = [
         alice.get("/users/me"),

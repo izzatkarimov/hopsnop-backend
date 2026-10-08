@@ -127,7 +127,7 @@ def test_session_cookie_is_http_only(client: TestClient, alice_account: User) ->
 def test_session_cookie_attributes(client: TestClient, alice_account: User) -> None:
     cookie = set_cookie(log_in(client))
 
-    assert cookie.key == "hopsnop_session"
+    assert cookie.key == "__Host-hopsnop_session"
     assert cookie["samesite"].lower() == "lax"
     assert cookie["path"] == "/"
     # Host-only: without a Domain attribute it is not sent to subdomains.
