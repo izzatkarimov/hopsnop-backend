@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session, contains_eager, with_expression
 
 from app.core.pagination import Cursor, Page, paginate
 from app.models import Story, StoryView, User
+from app.services.auth import hold_account
 from app.services.users import ACCOUNT_IS_SHOWN, is_followed_by
 
 STORY_LIFETIME_HOURS = 24
@@ -167,6 +168,7 @@ def create_story(
     caption: str | None = None,
 ) -> Story:
     """Publish a story by ``author``. It is shown for 24 hours from now."""
+    hold_account(db, author)
     now = _now()
     story = Story(
         author=author,
@@ -210,6 +212,25 @@ def delete_story(db: Session, user: User, story_id: uuid.UUID) -> None:
     db.commit()
 
 
+def _referred_to(db: Session, viewer: User, story_id: uuid.UUID) -> uuid.UUID:
+    """Make sure the story is shown to ``viewer``, and keep it there.
+
+    Returns the id of its author. The story's row is locked against being
+    deleted until the view of it is written (FOR KEY SHARE); nothing else is
+    held up by that. Without it a story deleted at this very moment would
+    fail the view's foreign key instead of being "not found".
+    """
+    author_id = db.scalar(
+        select(Story.author_id)
+        .join(Story.author)
+        .where(Story.id == story_id, *_shown_to(viewer, _now()))
+        .with_for_update(read=True, key_share=True, of=Story)
+    )
+    if author_id is None:
+        raise StoryNotFoundError
+    return author_id
+
+
 def record_view(db: Session, viewer: User, story_id: uuid.UUID) -> bool:
     """Record that ``viewer`` has viewed the story. Returns whether a view of
     theirs now exists.
@@ -222,17 +243,10 @@ def record_view(db: Session, viewer: User, story_id: uuid.UUID) -> bool:
     Only a story the viewer can see can be viewed. Any other is not found,
     with the answer that reading it gives.
     """
-    # Locked against being deleted until the view is written; nothing else
-    # is held up by it. Without it a story deleted at this very moment would
-    # fail the view's foreign key instead of being "not found".
-    author_id = db.scalar(
-        select(Story.author_id)
-        .join(Story.author)
-        .where(Story.id == story_id, *_shown_to(viewer, _now()))
-        .with_for_update(read=True, key_share=True, of=Story)
-    )
-    if author_id is None:
-        raise StoryNotFoundError
+    # The viewer's own account first, then the story: the order in which the
+    # removal of an account takes them.
+    hold_account(db, viewer)
+    author_id = _referred_to(db, viewer, story_id)
 
     if author_id != viewer.id:
         # The primary key (story, viewer) is what rules out a second row.

@@ -23,6 +23,7 @@ from helpers import (
     SENSITIVE_KEYS,
     add_post,
     add_user,
+    erase,
     follow,
     keys_in,
     log_in,
@@ -413,8 +414,7 @@ def test_reply_to_a_hidden_post_is_still_a_post_of_its_own(
 ) -> None:
     reply = add_post(session, bob_account, "Reply", parent=parent)
     nested = add_post(session, bob_account, "Nested", parent=reply)
-    parent.deleted_at = START
-    session.flush()
+    erase(session, parent, START)
 
     # Not listed under the post that is gone, and nothing else about it
     # changes: it is read, it is in the feed, and its own replies are listed.

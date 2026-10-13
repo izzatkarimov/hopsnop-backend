@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import Post, User
-from helpers import add_post, add_user, post_columns
+from helpers import add_post, add_user, post_columns, stored_post
 
 NOT_FOUND = {"detail": "Post not found."}
 PARENT_NOT_FOUND = {"detail": "Parent post not found."}
@@ -206,7 +206,8 @@ def test_cannot_reply_to_a_deleted_post(
         assert response.status_code == 404
         assert response.json() == PARENT_NOT_FOUND
 
-    assert post_count(session) == 1
+    # Neither the deleted post nor a reply to it is there.
+    assert post_count(session) == 0
 
 
 def test_no_profile_change_closes_a_post_to_replies(
@@ -404,8 +405,10 @@ def test_reply_is_deleted_like_any_post(
     assert bob_client.delete(f"/posts/{created['id']}").status_code == 204
 
     assert bob_client.get(f"/posts/{created['id']}").status_code == 404
-    assert post_columns(session, uuid.UUID(created["id"]))["deleted_at"] is not None
-    assert post_count(session) == 2
+    # Gone like any post that nobody has replied to; what it answered stays.
+    assert stored_post(session, uuid.UUID(created["id"])) is None
+    assert post_count(session) == 1
+    assert alice_client.get(f"/posts/{post['id']}").status_code == 200
     # And a deleted reply cannot be replied to.
     assert reply(alice_client, created["id"]).status_code == 404
 

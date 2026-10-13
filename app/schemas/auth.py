@@ -210,6 +210,15 @@ class ChangePasswordRequest(BaseModel):
     new_password: NewPassword
 
 
+class DeleteAccountRequest(BaseModel):
+    """Removing the caller's own account. The password is all it takes, and
+    all a client can say: which account it is, is the session's to tell."""
+
+    # Like the password at login: checked against the account, not against
+    # the policy for choosing one.
+    password: Annotated[SecretStr, Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)]
+
+
 # --- responses -----------------------------------------------------------
 
 

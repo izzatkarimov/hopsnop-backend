@@ -74,8 +74,14 @@ class Settings(BaseSettings):
     login_failures_per_identifier_and_ip: int = Field(default=5, gt=0)
     login_failures_per_identifier: int = Field(default=20, gt=0)
     login_failures_per_ip: int = Field(default=30, gt=0)
-    # Wrong current passwords when changing a password, per account.
-    password_change_failures: int = Field(default=5, gt=0)
+    # Wrong passwords where a signed-in user is asked for the password again,
+    # per account. Every operation that asks counts against the same limit,
+    # so a session that fell into the wrong hands gets this many guesses in
+    # all and not this many for each of them.
+    password_confirmation_failures: int = Field(default=5, gt=0)
+    # Exports of an account's data, per account. An export reads everything
+    # the account has, and nobody needs one after the other.
+    data_exports_per_account: int = Field(default=3, gt=0)
     # Requests per address, whatever their outcome.
     registrations_per_ip: int = Field(default=5, gt=0)
     # For /auth/forgot-password and /auth/resend-verification, each.
@@ -86,6 +92,37 @@ class Settings(BaseSettings):
     # for the same account is quietly not acted on, so that the link in the
     # owner's inbox cannot be made useless by asking again.
     email_token_cooldown_seconds: int = Field(default=300, ge=0)
+
+    # --- retention --------------------------------------------------------
+    # How long rows that are no longer used are kept before the purge
+    # removes them (``app.services.retention``, run by ``python -m
+    # app.purge``). Each period begins when the row stops being of use, not
+    # when it was written. These are engineering defaults, to be set by
+    # whoever operates a deployment; none of them is a period that some law
+    # asks for.
+    #
+    # A story, after it has expired. Until then its author still finds it
+    # in an export of their data.
+    expired_story_retention_hours: int = Field(default=24, ge=0)
+    # A session, after it has expired or was revoked, whichever came first.
+    ended_session_retention_days: int = Field(default=30, ge=0)
+    # A verification or reset token, after it was used or has expired,
+    # whichever came first.
+    spent_token_retention_days: int = Field(default=7, ge=0)
+    # A rate-limit counter, after its window is over. Such a counter counts
+    # nothing any more: the next request would start it again from one.
+    rate_limit_retention_hours: int = Field(default=1, ge=0)
+    # Whether accounts whose email address was never verified are removed at
+    # all. Off unless it is switched on: an account can only be verified if
+    # the link reaches its owner, and outside development no email is sent
+    # yet (``app.services.email``). Switched on there, this would remove
+    # every registration once its period is over.
+    purge_unverified_accounts: bool = False
+    # Such an account, after it was registered, if they are removed. Never
+    # zero: registering must leave time to open the link.
+    unverified_account_retention_days: int = Field(default=7, gt=0)
+    # How many rows the purge removes in one transaction, at most.
+    purge_batch_size: int = Field(default=1000, gt=0, le=10000)
 
     # --- requests ---------------------------------------------------------
     # The largest request body that is read. Every body this API takes is a
@@ -199,6 +236,26 @@ class Settings(BaseSettings):
     @property
     def email_token_cooldown(self) -> timedelta:
         return timedelta(seconds=self.email_token_cooldown_seconds)
+
+    @property
+    def expired_story_retention(self) -> timedelta:
+        return timedelta(hours=self.expired_story_retention_hours)
+
+    @property
+    def ended_session_retention(self) -> timedelta:
+        return timedelta(days=self.ended_session_retention_days)
+
+    @property
+    def spent_token_retention(self) -> timedelta:
+        return timedelta(days=self.spent_token_retention_days)
+
+    @property
+    def rate_limit_retention(self) -> timedelta:
+        return timedelta(hours=self.rate_limit_retention_hours)
+
+    @property
+    def unverified_account_retention(self) -> timedelta:
+        return timedelta(days=self.unverified_account_retention_days)
 
     @property
     def session_lifetime(self) -> timedelta:

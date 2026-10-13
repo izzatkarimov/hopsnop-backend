@@ -1,6 +1,6 @@
 """Small helpers shared by the API tests."""
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.cookies import Morsel, SimpleCookie
@@ -8,11 +8,13 @@ from urllib.parse import parse_qs, urlsplit
 
 from fastapi.testclient import TestClient
 from httpx import Response
-from sqlalchemy import event, select, update
+from sqlalchemy import String, Text, Uuid, event, func, select, table, update
+from sqlalchemy import column as sql_column
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.security import hash_password
+from app.db.base import Base
 from app.db.session import engine
 from app.models import (
     EmailVerificationToken,
@@ -68,11 +70,16 @@ def add_post(
     created_at: datetime | None = None,
     deleted: bool = False,
 ) -> Post:
-    """A post written directly to the database, as if created at ``created_at``."""
+    """A post written directly to the database, as if created at ``created_at``.
+
+    With ``deleted`` it is what is left of a post that was deleted while it
+    had replies: a tombstone, which has neither the author nor the text that
+    are passed in. The database allows no other kind of deleted post.
+    """
     created_at = created_at or datetime.now(timezone.utc)
     post = Post(
-        author_id=author.id,
-        content=content,
+        author_id=None if deleted else author.id,
+        content=None if deleted else content,
         parent_post_id=parent.id if parent is not None else None,
         created_at=created_at,
         updated_at=created_at,
@@ -81,6 +88,19 @@ def add_post(
     session.add(post)
     session.flush()
     return post
+
+
+def erase(session: Session, post: Post, at: datetime | None = None) -> None:
+    """Turn a post into a tombstone, directly in the database.
+
+    What deleting it does when it has replies: no author and no text are
+    left, and ``deleted_at`` says when. Its replies are not touched.
+    """
+    post.author = None
+    post.author_id = None
+    post.content = None
+    post.deleted_at = at or datetime.now(timezone.utc)
+    session.flush()
 
 
 def add_story(
@@ -129,6 +149,73 @@ def post_columns(session: Session, post_id: object) -> dict[str, object]:
     """
     row = session.execute(select(Post.__table__).where(Post.id == post_id)).one()
     return dict(row._mapping)
+
+
+def stored_post(session: Session, post_id: object) -> dict[str, object] | None:
+    """Every column of a post's row as currently stored, or None if there is
+    no such row any more."""
+    row = session.execute(
+        select(Post.__table__).where(Post.id == post_id)
+    ).one_or_none()
+    return dict(row._mapping) if row is not None else None
+
+
+def where_text_is_stored(session: Session, text: str) -> list[str]:
+    """Every ``table.column`` of the database that holds ``text`` anywhere.
+
+    All the columns that can hold text are searched, in every table of the
+    application, whichever there are. An empty list means the text is not
+    in the database at all.
+    """
+    found = []
+    for name, model_table in sorted(Base.metadata.tables.items()):
+        for model_column in model_table.columns:
+            if not isinstance(model_column.type, (String, Text)):
+                continue
+            holds_it = sql_column(model_column.name).contains(text, autoescape=True)
+            count = session.scalar(
+                select(func.count()).select_from(table(name)).where(holds_it)
+            )
+            if count:
+                found.append(f"{name}.{model_column.name}")
+    return found
+
+
+def where_id_is_stored(session: Session, value: object) -> list[str]:
+    """Every ``table.column`` of the database that holds this id anywhere.
+
+    All the columns that hold ids are searched, in every table of the
+    application: as a key of a row and as a reference to one.
+    """
+    found = []
+    for name, model_table in sorted(Base.metadata.tables.items()):
+        for model_column in model_table.columns:
+            if not isinstance(model_column.type, Uuid):
+                continue
+            count = session.scalar(
+                select(func.count())
+                .select_from(table(name))
+                .where(sql_column(model_column.name) == value)
+            )
+            if count:
+                found.append(f"{name}.{model_column.name}")
+    return found
+
+
+def what_is_left_of(
+    session: Session, *, user_id: object, texts: Iterable[str]
+) -> list[str]:
+    """Where anything of an account is still stored, by id or by text.
+
+    ``texts`` are the things that would say whose a row was or what they
+    wrote: the username, the email address, the display name, the texts of
+    posts and stories. An empty list means that nothing of the account is
+    left in any table.
+    """
+    left = [f"{place} (the id)" for place in where_id_is_stored(session, user_id)]
+    for text in texts:
+        left += [f"{place} ({text!r})" for place in where_text_is_stored(session, text)]
+    return left
 
 
 def registration(**overrides: object) -> dict:

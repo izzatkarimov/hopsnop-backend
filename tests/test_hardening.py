@@ -913,7 +913,8 @@ def test_limits_are_settings_with_defaults_and_cannot_be_switched_off(
         "registrations_per_ip",
         "email_requests_per_ip",
         "token_redemptions_per_ip",
-        "password_change_failures",
+        "password_confirmation_failures",
+        "data_exports_per_account",
         "rate_limit_window_minutes",
     ):
         with pytest.raises(ValidationError):

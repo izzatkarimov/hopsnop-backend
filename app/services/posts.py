@@ -33,7 +33,9 @@ from sqlalchemy.orm import Session, contains_eager, with_expression
 
 from app.core.pagination import Cursor, Page, paginate
 from app.models import Like, Post, Repost, User
-from app.services.users import is_followed_by
+from app.services import erasure
+from app.services.auth import hold_account
+from app.services.users import ACCOUNT_IS_SHOWN, is_followed_by
 
 EDIT_WINDOW_MINUTES = 60
 # How long after it was created a post can still be edited. The deadline is
@@ -86,13 +88,12 @@ def _now() -> datetime:
 # Which posts are shown is decided in this section and nowhere else. Every
 # read below, and every check that a post "exists" for someone, goes through
 # ``_visible_posts``.
-
-# The rule public profiles use: an account that is deactivated, or whose
-# email address was never verified, is not shown, and neither are its posts.
-_ACCOUNT_IS_SHOWN = (
-    User.is_active.is_(True),
-    User.email_verified_at.is_not(None),
-)
+#
+# Which accounts are shown is not decided here. It is the rule public
+# profiles use (``app.services.users.ACCOUNT_IS_SHOWN``): an account that is
+# deactivated, or whose email address was never verified, is not shown, and
+# neither are its posts. There is one such rule, and this module has no copy
+# of it.
 
 
 # A like and a repost are the same thing to the database: a row that says
@@ -165,7 +166,7 @@ def _visible_posts(viewer: User | None) -> Select[tuple[Post]]:
             with_expression(Post.repost_count, _count_of(Repost, Post.id)),
             with_expression(Post.reposted_by_me, _made_by(Repost, Post.id, viewer)),
         )
-        .where(Post.deleted_at.is_(None), *_ACCOUNT_IS_SHOWN)
+        .where(Post.deleted_at.is_(None), *ACCOUNT_IS_SHOWN)
     )
 
 
@@ -199,7 +200,7 @@ def list_user_posts(
     found, exactly as for its profile.
     """
     account_id = db.scalar(
-        select(User.id).where(User.username == username, *_ACCOUNT_IS_SHOWN)
+        select(User.id).where(User.username == username, *ACCOUNT_IS_SHOWN)
     )
     if account_id is None:
         raise UserNotFoundError
@@ -289,7 +290,7 @@ def list_replies(
     shown = db.scalar(
         select(Post.id)
         .join(Post.author)
-        .where(Post.id == post_id, Post.deleted_at.is_(None), *_ACCOUNT_IS_SHOWN)
+        .where(Post.id == post_id, Post.deleted_at.is_(None), *ACCOUNT_IS_SHOWN)
     )
     if shown is None:
         raise PostNotFoundError
@@ -317,12 +318,13 @@ def create_post(
 
     A post can be replied to while it is shown. A parent that does not
     exist, was deleted, or is not shown is refused with one and the same
-    answer.
+    answer. The parent is held in place until the reply is written
+    (``_referred_to``), so it cannot be deleted from under it. Before that,
+    and for the same reason, the author's own account is (``hold_account``).
     """
+    hold_account(db, author)
     if parent_post_id is not None:
-        parent = db.scalar(_visible_posts(author).where(Post.id == parent_post_id))
-        if parent is None:
-            raise ParentPostNotFoundError
+        _referred_to(db, author, parent_post_id, not_found=ParentPostNotFoundError)
 
     now = _now()
     post = Post(
@@ -357,15 +359,22 @@ def update_post(db: Session, user: User, post_id: uuid.UUID, *, content: str) ->
 
 
 def delete_post(db: Session, user: User, post_id: uuid.UUID) -> None:
-    """Delete one of the user's own posts, by marking it as deleted.
+    """Delete one of the user's own posts, for good.
 
-    The row is kept, and so is everything that refers to it: its likes and
-    reposts, and its replies, which stay what they are. From here on the post
-    is not found by anyone, its author included, so it can be neither edited
-    nor deleted a second time.
+    Nothing of its text or of who wrote it is kept, and its likes and
+    reposts are removed. If nobody has replied to it the row is removed
+    altogether. If somebody has, the row stays as a tombstone that holds the
+    thread together, and the replies stay what they are
+    (``app.services.erasure``).
+
+    Either way the post is from here on not found by anyone, its author
+    included, so it can be neither edited nor deleted a second time.
     """
+    # Before the post is locked: that is the order an erasure takes the two
+    # in, whoever asks for it (see ``app.services.erasure``).
+    erasure.lock_erasure(db)
     post = _own_post_for_change(db, user, post_id)
-    post.deleted_at = _now()
+    erasure.erase_posts(db, [post.id], _now())
     db.commit()
 
 
@@ -389,6 +398,45 @@ def _own_post_for_change(db: Session, user: User, post_id: uuid.UUID) -> Post:
     if post.author_id != user.id:
         raise NotPostAuthorError
     return post
+
+
+def _referred_to(
+    db: Session,
+    user: User,
+    post_id: uuid.UUID,
+    *,
+    not_found: type[PostError],
+) -> None:
+    """Make sure the post is shown to ``user``, and keep it there.
+
+    For what is about to write a row that refers to the post: a reply to it,
+    a like, a repost. The post's row is locked against being removed until
+    that row is written and committed (FOR KEY SHARE, the lock a foreign key
+    takes anyway, only taken earlier and held for longer).
+
+    Without it there would be a moment between finding the post and writing
+    the row in which the post could be deleted. The row would then fail the
+    foreign key, or be left on a post that no longer has its text. With it,
+    one of the two comes first. Either the row is written, and the deletion
+    that follows deals with it: the like is removed, the reply keeps the
+    post as a tombstone. Or the deletion is, and this waits for it and then
+    finds no post, which is the ordinary "not found".
+
+    Nothing else is held up: readers take no locks, and any number of
+    replies and likes can hold a post in this way at once.
+
+    Whoever calls this holds their own account already (``hold_account``):
+    the account first, then the post, which is the order an erasure takes
+    them in.
+    """
+    found = db.scalar(
+        select(Post.id)
+        .join(Post.author)
+        .where(Post.id == post_id, Post.deleted_at.is_(None), *ACCOUNT_IS_SHOWN)
+        .with_for_update(read=True, key_share=True, of=Post)
+    )
+    if found is None:
+        raise not_found
 
 
 # --- likes and reposts ---------------------------------------------------
@@ -434,9 +482,14 @@ def _set_interaction(
 
     Only a post the user can see can be liked or reposted, and only from
     such a post can either be taken back. Any other post is not found, with
-    the answer and the lookup that reading it gives.
+    the answer that reading it gives.
+
+    The post is held in place while this is done (``_referred_to``), so a
+    like cannot be written to a post that is being deleted at that moment.
+    The user's own account is held first (``hold_account``).
     """
-    get_post(db, post_id, user)
+    hold_account(db, user)
+    _referred_to(db, user, post_id, not_found=PostNotFoundError)
 
     if wanted:
         # The primary key (user, post) is what rules out a second row. The

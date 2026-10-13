@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 
 from fastapi import Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
 
 from app.core.config import settings
 from app.core.pagination import (
@@ -137,8 +138,12 @@ CurrentSession = Annotated[UserSession, Depends(get_current_session)]
 
 
 def get_current_user(session: CurrentSession) -> User:
-    """The authenticated user. Endpoints that need one depend on this."""
-    return session.user
+    """The authenticated user. Endpoints that need one depend on this.
+
+    A session whose account has been removed since it was found is not
+    authenticated any more (``account_of``).
+    """
+    return auth_service.account_of(session)
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
@@ -165,9 +170,30 @@ def get_optional_user(request: Request, db: DbSession) -> User | None:
     For endpoints that anyone may call but whose answer depends on who is
     asking. A cookie that does not belong to a usable session counts as no
     cookie: the request is answered as an anonymous one, not refused.
+
+    That includes a session whose account is removed just as it is found.
+    The rows that were read a moment ago are then gone, which shows when
+    they are written to or read again (see ``account_of``). Where a session
+    is required that is answered with 401; here it is one more cookie that
+    belongs to nobody.
     """
-    session = _session_from_cookie(request, db)
-    return session.user if session is not None else None
+    try:
+        session = _session_from_cookie(request, db)
+        if session is None:
+            return None
+        user = auth_service.account_of(session)
+        # Noting when the session was used ends a transaction, and the
+        # account is then read again by whatever first asks for something
+        # of it. That is done here, where its absence can still be answered.
+        _ = user.is_active
+    except (
+        auth_service.AccountNoLongerExistsError,
+        ObjectDeletedError,
+        StaleDataError,
+    ):
+        db.rollback()
+        return None
+    return user
 
 
 OptionalUser = Annotated[User | None, Depends(get_optional_user)]

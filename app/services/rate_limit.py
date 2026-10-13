@@ -26,8 +26,8 @@ turned out to be.
 The window is fixed: it begins with the first request counted and ends a set
 time later, however many requests follow. Being refused does not extend it.
 
-Transactions. ``count`` and ``uncount_all`` commit the session they are
-given, so that a count stands whatever becomes of the request and no row
+Transactions. ``count``, ``uncount_all`` and ``forget`` commit the session
+they are given, so that a count stands whatever becomes of the request and no row
 stays locked while the request does its work. This is not a general-purpose
 utility that can be called from anywhere: committing the session commits
 everything pending in it. Call these only at a point where the session holds
@@ -42,7 +42,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import case, or_, select, update
+from sqlalchemy import case, delete, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -180,4 +180,20 @@ def uncount_all(db: Session, reservations: Sequence[Reservation]) -> None:
             )
             .values(count=RateLimit.count - 1)
         )
+    db.commit()
+
+
+def forget(db: Session, limits: Sequence[Limit]) -> None:
+    """Remove these counters altogether, whatever they hold.
+
+    For what they were counted for no longer existing: an account that was
+    removed leaves no counter under its name, its address or its id, so
+    whoever takes the name next does not inherit the failures counted
+    against it.
+
+    Commits the session (see the module's note on transactions).
+    """
+    keys = [key_hash(limit.scope, limit.subject) for limit in limits]
+    if keys:
+        db.execute(delete(RateLimit).where(RateLimit.key_hash.in_(keys)))
     db.commit()

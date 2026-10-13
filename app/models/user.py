@@ -50,7 +50,8 @@ class User(Base):
     # Authored content is never deleted as a side effect of deleting a user.
     # The foreign keys are ON DELETE RESTRICT, and passive_deletes="all" keeps
     # the ORM from touching these rows so the database makes that decision.
-    # Accounts are deactivated through is_active instead.
+    # An account is removed by erasing its posts and removing its stories
+    # first, in that order (``app.services.erasure``).
     posts: Mapped[list[Post]] = relationship(
         back_populates="author",
         passive_deletes="all",

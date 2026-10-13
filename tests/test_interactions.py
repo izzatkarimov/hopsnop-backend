@@ -1083,31 +1083,54 @@ def test_deleted_post_cannot_be_interacted_with_by_its_own_author(
     assert rows(session, kind) == 0
 
 
-@pytest.mark.parametrize("how", ["deleted", "deactivated"])
-def test_interaction_cannot_be_changed_once_the_post_is_hidden(
+def test_interaction_cannot_be_changed_while_the_posts_author_is_not_shown(
     bob_client: TestClient,
     session: Session,
     alice_account: User,
     kind: Kind,
     method: str,
-    how: str,
 ) -> None:
     post = add_post(session, alice_account)
-    assert do(bob_client, kind, post.id).json() == state(kind, True, 1)
+    post_id = post.id
+    assert do(bob_client, kind, post_id).json() == state(kind, True, 1)
 
-    if how == "deleted":
-        post.deleted_at = datetime.now(timezone.utc)
-    else:
-        alice_account.is_active = False
+    alice_account.is_active = False
     session.flush()
-    response = change(bob_client, method, kind, post.id)
+    response = change(bob_client, method, kind, post_id)
 
     # Not found, like the post itself, and the attempt changes nothing: the
-    # row stays with the post it belongs to, as it does when a post is
-    # deleted.
+    # row stays with the post it belongs to, which is only hidden.
     assert response.status_code == 404
     assert response.json() == NOT_FOUND
     assert rows(session, kind) == 1
+
+
+@pytest.mark.parametrize("answered", [False, True])
+def test_interaction_is_gone_with_the_post_once_it_is_deleted(
+    alice_client: TestClient,
+    bob_client: TestClient,
+    session: Session,
+    bob_account: User,
+    kind: Kind,
+    method: str,
+    answered: bool,
+) -> None:
+    post = alice_client.post("/posts", json={"content": "Short-lived"}).json()
+    if answered:
+        # With a reply the post's row stays, as a tombstone. Not what was
+        # liked or reposted: that is gone either way.
+        bob_client.post(
+            "/posts", json={"content": "Reply", "parent_post_id": post["id"]}
+        )
+    assert do(bob_client, kind, post["id"]).json() == state(kind, True, 1)
+
+    assert alice_client.delete(f"/posts/{post['id']}").status_code == 204
+    response = change(bob_client, method, kind, post["id"])
+
+    assert response.status_code == 404
+    assert response.json() == NOT_FOUND
+    # Removed with the post, and not written again by the attempt.
+    assert rows(session, kind) == 0
 
 
 def test_deleted_post_reports_nothing_about_its_interactions(
@@ -1128,8 +1151,8 @@ def test_deleted_post_reports_nothing_about_its_interactions(
         assert single.json() == NOT_FOUND
         assert reader.get("/feed").json() == {"items": [], "next_cursor": None}
         assert reader.get("/users/alice/posts").json()["items"] == []
-    # The rows are kept with the post, as they were before this phase.
-    assert rows(session, kind) == 2
+    # And there is nothing to report: they were removed with the post.
+    assert rows(session, kind) == 0
 
 
 def test_interaction_is_shown_again_when_the_post_can_be_read_again(
@@ -1301,8 +1324,9 @@ def test_changing_an_interaction_takes_the_same_queries_however_many_there_are(
     with recorded_selects() as for_popular:
         assert do(bob_client, kind, popular).json() == state(kind, True, 13)
 
-    # The session, the post, and how things stand after the change.
-    assert len(for_quiet) == len(for_popular) == 3
+    # The session, the user's own account held in place, the post, and how
+    # things stand after the change.
+    assert len(for_quiet) == len(for_popular) == 4
 
 
 def test_written_post_is_returned_by_the_query_that_every_read_uses(
@@ -1325,8 +1349,10 @@ def test_written_post_is_returned_by_the_query_that_every_read_uses(
         assert "FROM likes WHERE likes.post_id = posts.id" in returned
         assert "FROM reposts WHERE reposts.post_id = posts.id" in returned
         assert "posts.deleted_at IS NULL" in returned
-    # The same number of statements as before posts had interactions.
-    assert (len(creating), len(editing)) == (3, 4)
+    # The same number of statements as before posts had interactions, and
+    # for creating one more: the author's account is held in place while the
+    # post is written.
+    assert (len(creating), len(editing)) == (4, 4)
 
 
 def test_interactions_are_counted_by_the_statement_that_loads_the_posts(

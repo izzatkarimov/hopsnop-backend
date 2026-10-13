@@ -1684,8 +1684,9 @@ def test_following_takes_the_same_queries_however_many_follows_there_are(
     with recorded_selects() as for_popular:
         assert change(bob_client, method, "alice").status_code == 200
 
-    # The session, the account, and how things stand after the change.
-    assert len(for_quiet) == len(for_popular) == 3
+    # The session, the user's own account held in place, the account it is
+    # about, and how things stand after the change.
+    assert len(for_quiet) == len(for_popular) == 4
 
 
 def test_list_is_filtered_ordered_and_cut_by_the_database(

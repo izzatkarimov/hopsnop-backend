@@ -28,6 +28,7 @@ from sqlalchemy.orm import InstrumentedAttribute, Session, contains_eager
 
 from app.core.pagination import Cursor, Page, paginate
 from app.models import Follow, User
+from app.services.auth import hold_account
 
 # The only columns the profile API may write. ``update_profile`` refuses
 # anything else, whatever the caller passes in.
@@ -186,15 +187,24 @@ def is_followed_by(
     )
 
 
-def _shown_user_id(db: Session, username: str) -> uuid.UUID:
+def _shown_user_id(db: Session, username: str, *, hold: bool = False) -> uuid.UUID:
     """The id of the account with this (canonical) username, if it is shown.
 
     An account that is not shown is not found, for whatever reason it is not
     shown and with the answer its profile gives.
+
+    With ``hold`` the account's row is locked against being removed until
+    the transaction ends (FOR KEY SHARE, the lock a foreign key takes
+    anyway, only taken earlier). That is for what is about to write a row
+    that refers to the account. An account being removed at that moment is
+    then either waited for, and found gone, or made to wait until the row
+    is written, and takes it along. Without the lock the row could fail its
+    foreign key between the look and the write.
     """
-    user_id = db.scalar(
-        select(User.id).where(User.username == username, *ACCOUNT_IS_SHOWN)
-    )
+    found = select(User.id).where(User.username == username, *ACCOUNT_IS_SHOWN)
+    if hold:
+        found = found.with_for_update(read=True, key_share=True)
+    user_id = db.scalar(found)
     if user_id is None:
         raise UserNotFoundError
     return user_id
@@ -211,8 +221,12 @@ def set_follow(db: Session, user: User, username: str, *, following: bool) -> bo
     Who follows is always ``user``. Only an account that is shown can be
     followed, and only such an account can be unfollowed; any other is not
     found.
+
+    Both accounts are held in place until the row is written: the user's
+    own first (``hold_account``), then the one it is about.
     """
-    target_id = _shown_user_id(db, username)
+    hold_account(db, user)
+    target_id = _shown_user_id(db, username, hold=True)
 
     if following:
         # The database refuses this row too (ck_follows_no_self_follow), but

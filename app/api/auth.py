@@ -19,9 +19,11 @@ from app.api.deps import (
     limit_per_address,
 )
 from app.core.config import settings
+from app.models import UserSession
 from app.schemas.auth import (
     AccountResponse,
     ChangePasswordRequest,
+    DeleteAccountRequest,
     ForgotPasswordRequest,
     LoginRequest,
     MessageResponse,
@@ -112,6 +114,37 @@ def _login_limits(identifier: str, address: str) -> list[rate_limit.Limit]:
     ]
 
 
+def password_confirmation_limits(current: UserSession) -> list[rate_limit.Limit]:
+    """The counter of wrong passwords given to confirm an operation.
+
+    A session alone must not be enough to find out the password by trying.
+    Wrong passwords are limited per account, like failed logins, and there
+    is one counter for every operation that asks for the password again: it
+    is the account's, not the operation's.
+    """
+    return [
+        rate_limit.Limit(
+            "password-confirmation:account",
+            str(current.user_id),
+            settings.password_confirmation_failures,
+        )
+    ]
+
+
+def data_export_limit(current: UserSession) -> rate_limit.Limit:
+    """The counter of exports of an account's data.
+
+    An export reads everything the account has. It is limited per account,
+    wherever its sessions are, and it is exports that are counted: a request
+    that was refused for its password is not one.
+    """
+    return rate_limit.Limit(
+        "data-export:account",
+        str(current.user_id),
+        settings.data_exports_per_account,
+    )
+
+
 @router.post(
     "/register",
     response_model=AccountResponse,
@@ -163,9 +196,13 @@ def login(
         raise
     # Only failures are limited: a login that succeeds is not counted.
     rate_limit.uncount_all(db, counted)
+    # The account is read again here, after the session was committed. Should
+    # it have been removed in that moment, the login has come to nothing, and
+    # is answered as that and not with a cookie for a session that is gone.
+    account = auth_service.account_of(session)
     # The token leaves the server only in this cookie, never in the body.
     _set_session_cookie(response, raw_token)
-    return AccountResponse.model_validate(session.user)
+    return AccountResponse.model_validate(account)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -286,24 +323,24 @@ def change_password(
     Every other session of the user is ended. This one continues, under a
     new cookie.
     """
-    # A session alone must not be enough to find out the password by trying:
-    # wrong current passwords are limited per account, like failed logins.
-    limits = [
-        rate_limit.Limit(
-            "change-password:account",
-            str(current.user_id),
-            settings.password_change_failures,
-        )
-    ]
-    counted = rate_limit.count_all(db, limits)
-    # Read before the change commits, which expires what the session holds.
+    # Read first. Counting commits, and a commit expires what the session
+    # holds; the session may be gone by the time it would be read again.
     remaining = current.expires_at - datetime.now(timezone.utc)
-    raw_token = auth_service.change_password(
-        db,
-        current,
-        current_password=data.current_password.get_secret_value(),
-        new_password=data.new_password.get_secret_value(),
-    )
+    limits = password_confirmation_limits(current)
+    counted = rate_limit.count_all(db, limits)
+    try:
+        raw_token = auth_service.change_password(
+            db,
+            current,
+            current_password=data.current_password.get_secret_value(),
+            new_password=data.new_password.get_secret_value(),
+        )
+    except auth_service.AccountNoLongerExistsError:
+        # The account was removed while this was under way, and its counter
+        # with it. What was counted here since is not left behind for an
+        # account that is not there.
+        rate_limit.forget(db, limits)
+        raise
     rate_limit.uncount_all(db, counted)
     # The session ends when it would have: the cookie is given the time that
     # is left, not a new lifetime.
@@ -311,6 +348,69 @@ def change_password(
         response, raw_token, max_age=max(1, int(remaining.total_seconds()))
     )
     return MessageResponse(message="Password has been changed.")
+
+
+# --- account deletion ----------------------------------------------------
+
+
+def _counters_named_after(
+    current: UserSession, address: str
+) -> list[rate_limit.Limit]:
+    """The rate-limit counters that are kept under the account's own names.
+
+    Those of failed logins by its username and by its email address, as far
+    as they can be addressed (from every address taken together, and from
+    the address of this request), and the account's own counters: of
+    password confirmations and of exports. Counters of its logins from other
+    addresses cannot be told from here; they hold no name and are gone when
+    their window is.
+
+    The counter of the address alone is not among them. It is the
+    address's, not the account's: removing an account must not give
+    whoever sits at that address their guesses at other accounts back.
+    """
+    account = auth_service.account_of(current)
+    limits = [*password_confirmation_limits(current), data_export_limit(current)]
+    for identifier in (account.username, account.email):
+        limits += [
+            limit
+            for limit in _login_limits(identifier, address)
+            if limit.subject != address
+        ]
+    return limits
+
+
+@router.post("/delete-account", status_code=status.HTTP_204_NO_CONTENT)
+def delete_account(
+    data: DeleteAccountRequest,
+    current: CurrentSession,
+    address: ClientAddress,
+    response: Response,
+    db: DbSession,
+) -> None:
+    """Removes the signed-in user's account, at once and for good.
+
+    The password has to be given again: a session alone does not remove an
+    account. Whose account it is, is always the signed-in user's; there is
+    no way to name another.
+
+    With the account go its posts, stories, likes, reposts and follows, and
+    every session of it. A post that others have replied to leaves an empty
+    place in its thread, with no author and no text. The username and the
+    email address are free again from that moment.
+    """
+    # Worked out first, while the account can still be read.
+    to_forget = _counters_named_after(current, address)
+    # Wrong passwords count against the same limit as for a password change:
+    # the account's, whatever asks for the password.
+    rate_limit.count_all(db, password_confirmation_limits(current))
+    auth_service.delete_account(
+        db, current, password=data.password.get_secret_value()
+    )
+    # What was counted under the account's names does not stay behind for
+    # whoever takes them next.
+    rate_limit.forget(db, to_forget)
+    _clear_session_cookie(response)
 
 
 # --- session management --------------------------------------------------
@@ -321,6 +421,7 @@ def list_sessions(
     current: CurrentSession,
     db: DbSession,
 ) -> list[SessionResponse]:
+    account = auth_service.account_of(current)
     return [
         SessionResponse(
             id=session.id,
@@ -329,7 +430,7 @@ def list_sessions(
             expires_at=session.expires_at,
             is_current=session.id == current.id,
         )
-        for session in auth_service.list_sessions(db, current.user)
+        for session in auth_service.list_sessions(db, account)
     ]
 
 
@@ -350,7 +451,8 @@ def revoke_session(
     db: DbSession,
 ) -> None:
     is_current = session_id == current.id
-    if not auth_service.revoke_session(db, current.user, session_id):
+    account = auth_service.account_of(current)
+    if not auth_service.revoke_session(db, account, session_id):
         # Also the answer for a session that belongs to someone else, so the
         # endpoint does not reveal which session ids exist.
         raise HTTPException(

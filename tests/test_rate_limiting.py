@@ -9,10 +9,8 @@ transactions.
 
 import hashlib
 import re
-import threading
 import uuid
-from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -23,7 +21,6 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.security import hash_token
 from app.db.session import SessionLocal
-from app.main import app
 from app.models import (
     EmailVerificationToken,
     PasswordResetToken,
@@ -34,9 +31,9 @@ from app.models import (
 from app.services import auth as auth_service
 from app.services import rate_limit
 from app.services.rate_limit import Limit, RateLimitedError, key_hash
+from concurrency import Account, at_once
 from helpers import (
     PASSWORD,
-    PASSWORD_HASH,
     add_user,
     let_cooldown_pass,
     log_in,
@@ -1131,128 +1128,12 @@ def test_cooldowns_of_the_two_kinds_of_link_are_separate(
 #
 # These commit for real, on connections of their own, and remove what they
 # wrote. Each works on an account and on addresses that nothing else uses.
-
-LOGIN_SCOPES = ("login:identifier+address", "login:address", "login:identifier")
-ADDRESS_SCOPES = (
-    "login:address",
-    "forgot-password",
-    "resend-verification",
-    "verify-email",
-    "reset-password",
-)
-
-
-class Committed:
-    """An account that really exists, with the addresses used against it."""
-
-    def __init__(self, *, verified: bool = True) -> None:
-        self.name = f"race_{uuid.uuid4().hex[:12]}"
-        self.email = f"{self.name}@example.com"
-        self.run = uuid.uuid4().hex
-        self.addresses: set[str] = set()
-        with SessionLocal() as db:
-            user = User(
-                username=self.name,
-                email=self.email,
-                password_hash=PASSWORD_HASH,
-                display_name="Race",
-                email_verified_at=datetime.now(timezone.utc) if verified else None,
-            )
-            db.add(user)
-            db.commit()
-            self.id = user.id
-
-    def address(self, number: int = 0) -> str:
-        address = f"race-{self.run}-{number}"
-        self.addresses.add(address)
-        return address
-
-    def client(self, number: int = 0) -> TestClient:
-        # The application as it really runs: its own database sessions.
-        return TestClient(
-            app, base_url="https://testserver", client=(self.address(number), 50000)
-        )
-
-    def keys(self) -> list[str]:
-        keys = [key_hash("login:identifier", self.name)]
-        keys += [key_hash("login:identifier", self.email)]
-        for address in self.addresses:
-            keys += [key_hash(scope, address) for scope in ADDRESS_SCOPES]
-            for identifier in (self.name, self.email):
-                keys.append(
-                    key_hash("login:identifier+address", f"{identifier}\x00{address}")
-                )
-        return keys
-
-    def login_counters(self, number: int = 0) -> list[int | None]:
-        """The three counters of failed logins by name from one address."""
-        address = self.address(number)
-        subjects = (f"{self.name}\x00{address}", address, self.name)
-        with SessionLocal() as db:
-            return [
-                db.scalar(
-                    select(RateLimit.count).where(
-                        RateLimit.key_hash == key_hash(scope, subject)
-                    )
-                )
-                for scope, subject in zip(LOGIN_SCOPES, subjects)
-            ]
-
-    def unused_tokens(self, model: type) -> list[str]:
-        with SessionLocal() as db:
-            return list(
-                db.scalars(
-                    select(model.token_hash).where(
-                        model.user_id == self.id, model.used_at.is_(None)
-                    )
-                )
-            )
-
-    def remove(self) -> None:
-        with SessionLocal() as db:
-            db.execute(delete(RateLimit).where(RateLimit.key_hash.in_(self.keys())))
-            # Its sessions and tokens go with it.
-            db.execute(delete(User).where(User.id == self.id))
-            db.commit()
-
+# What they share with the other tests of this kind is in ``concurrency``.
 
 @pytest.fixture
-def committed() -> Iterator[Callable[..., Committed]]:
-    made: list[Committed] = []
-
-    def make(**kwargs: bool) -> Committed:
-        made.append(Committed(**kwargs))
-        return made[-1]
-
-    yield make
-    for account in made:
-        account.remove()
-
-
-@pytest.fixture
-def issued(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Every raw token the application generates, in the order it does."""
-    tokens: list[str] = []
-    generate = auth_service.generate_token
-
-    def recording_generate() -> str:
-        tokens.append(generate())
-        return tokens[-1]
-
-    monkeypatch.setattr(auth_service, "generate_token", recording_generate)
-    return tokens
-
-
-def at_once(count: int, request: Callable[[int], int]) -> list[int]:
-    """The answers to ``count`` requests that are all sent at the same moment."""
-    together = threading.Barrier(count)
-
-    def run(number: int) -> int:
-        together.wait()
-        return request(number)
-
-    with ThreadPoolExecutor(count) as pool:
-        return list(pool.map(run, range(count)))
+def committed(account: Callable[..., Account]) -> Callable[..., Account]:
+    """Creates accounts that really exist; see ``concurrency`` and ``conftest``."""
+    return account
 
 
 def test_concurrent_requests_cannot_get_past_a_counter() -> None:
@@ -1425,7 +1306,7 @@ def test_concurrent_correct_and_wrong_logins_count_only_the_wrong_ones(
 # --- links, between transactions -----------------------------------------
 
 
-def reset_with(account: Committed, token: str, number: int = 99) -> int:
+def reset_with(account: Account, token: str, number: int = 99) -> int:
     with account.client(number) as client:
         return client.post(
             "/auth/reset-password",

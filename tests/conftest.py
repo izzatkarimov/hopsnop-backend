@@ -22,6 +22,7 @@ os.environ.setdefault("ENVIRONMENT", "development")
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -29,10 +30,54 @@ from app.core.config import settings
 from app.db.session import engine
 from app.main import app
 from app.models import Post, Story, User
+from app.services import auth as auth_service
 from app.services import posts as posts_service
 from app.services import stories as stories_service
 from app.services.email import get_email_sender
+from concurrency import Account, remove_accounts
+from database_guard import leak_report, refusal, tables_with_rows
 from helpers import add_user, log_in
+
+# --- the database the tests run against ----------------------------------
+#
+# See ``database_guard``: the tests are not run against a database that has
+# anything in it, and they must leave it as empty as they found it.
+
+_FOUND_EMPTY = pytest.StashKey[bool]()
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    if session.config.option.collectonly:
+        return
+    try:
+        with engine.connect() as connection:
+            found = tables_with_rows(connection)
+    except SQLAlchemyError as error:
+        # Only what kind of error it was: its text can hold the connection
+        # string, and with it the password.
+        pytest.exit(
+            "\nThe tests were not run: the database could not be checked "
+            f"({type(error).__name__}). Is it running, and is its schema "
+            "created (alembic upgrade head)?\n",
+            returncode=2,
+        )
+    if found:
+        pytest.exit(refusal(found, engine.url), returncode=2)
+    session.config.stash[_FOUND_EMPTY] = True
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    if not session.config.stash.get(_FOUND_EMPTY, False):
+        return
+    with engine.connect() as connection:
+        found = tables_with_rows(connection)
+    if not found:
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_sep("=", "the database was not left empty", red=True)
+        reporter.write_line(leak_report(found), red=True)
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture
@@ -211,3 +256,36 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
     monkeypatch.setattr(posts_service, "_now", clock)
     monkeypatch.setattr(stories_service, "_now", clock)
     return clock
+
+
+# --- requests that arrive together ----------------------------------------
+#
+# For the tests that cannot run in the one transaction above, because what
+# they are about is what happens between transactions. See ``concurrency``.
+
+
+@pytest.fixture
+def account() -> Iterator[Callable[..., Account]]:
+    """Creates accounts that really exist, and removes them afterwards."""
+    made: list[Account] = []
+
+    def make(**kwargs: bool) -> Account:
+        made.append(Account(**kwargs))
+        return made[-1]
+
+    yield make
+    remove_accounts(made)
+
+
+@pytest.fixture
+def issued(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every raw token the application generates, in the order it does."""
+    tokens: list[str] = []
+    generate = auth_service.generate_token
+
+    def recording_generate() -> str:
+        tokens.append(generate())
+        return tokens[-1]
+
+    monkeypatch.setattr(auth_service, "generate_token", recording_generate)
+    return tokens

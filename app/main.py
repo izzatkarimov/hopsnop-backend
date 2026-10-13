@@ -3,6 +3,9 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from psycopg.errors import ForeignKeyViolation
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
 
 from app.api.auth import router as auth_router
 from app.api.deps import verify_request_origin
@@ -38,6 +41,45 @@ async def handle_rate_limited(request: Request, exc: RateLimitedError) -> JSONRe
         content={"detail": exc.detail},
         headers={"Retry-After": str(exc.retry_after)},
     )
+
+
+async def handle_lost_reference(request: Request, exc: IntegrityError) -> JSONResponse:
+    """A write that refers to something which was removed just before it.
+
+    The services hold what they refer to in place while they write: the
+    post that is replied to or liked, the account that is followed, and
+    first of all the account they write for. So this is not how a deletion
+    that happens at the same moment is met, and nothing in the application
+    is known to end up here. It is what is left should a write ever refer
+    to something without holding it. That would not be a fault of the
+    request, and it is answered as a conflict, not as a server error.
+
+    Any other integrity error is one, and goes on to be handled as such.
+    """
+    if not isinstance(exc.orig, ForeignKeyViolation):
+        raise exc
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "The request could not be completed."},
+    )
+
+
+async def handle_removed_account(
+    request: Request, exc: ObjectDeletedError | StaleDataError
+) -> JSONResponse:
+    """A request whose own account was removed while it was under way.
+
+    A request is authenticated at its start and then works with the rows it
+    was given then: the session and the account. If the account is removed
+    by another request in the meantime, those rows are gone, and reading or
+    changing them fails in one of these two ways. Every row the application
+    handles like this is the requester's own, so this is what it means, and
+    the answer is the one a request without a session gets, which is what
+    the request has become.
+
+    Nothing was written: the change found no row to apply to.
+    """
+    return JSONResponse(status_code=401, content={"detail": "Not authenticated."})
 
 
 async def handle_validation_error(
@@ -125,6 +167,9 @@ def create_app() -> FastAPI:
     for service_error in (AuthError, PostError, StoryError, UserError):
         app.add_exception_handler(service_error, handle_service_error)
     app.add_exception_handler(RateLimitedError, handle_rate_limited)
+    app.add_exception_handler(IntegrityError, handle_lost_reference)
+    for removed in (ObjectDeletedError, StaleDataError):
+        app.add_exception_handler(removed, handle_removed_account)
     app.add_exception_handler(RequestValidationError, handle_validation_error)
     app.add_exception_handler(Exception, handle_unexpected_error)
 

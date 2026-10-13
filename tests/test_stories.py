@@ -883,8 +883,11 @@ def test_hidden_story_takes_the_same_queries_as_one_that_does_not_exist(
         recorded.append(statements)
 
     # The session, then one lookup that finds nothing: the work done does
-    # not depend on whether, or why, the story is hidden.
-    assert [len(statements) for statements in recorded] == [2] * len(HIDDEN)
+    # not depend on whether, or why, the story is hidden. A view is written
+    # in the viewer's name, so their own account is held in place before
+    # the story is looked for.
+    expected = 3 if action == "view" else 2
+    assert [len(statements) for statements in recorded] == [expected] * len(HIDDEN)
     assert len({tuple(statements) for statements in recorded}) == 1
 
 

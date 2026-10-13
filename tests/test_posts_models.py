@@ -12,7 +12,8 @@ from sqlalchemy import func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Like, Post, Repost, User
+from app.models import Post, User
+from helpers import erase
 
 
 def reply_to(
@@ -45,8 +46,7 @@ def test_new_post_has_equal_created_and_updated_times(
 
 
 def test_deleted_at_is_timezone_aware(session: Session, post: Post) -> None:
-    post.deleted_at = datetime.now(timezone.utc)
-    session.flush()
+    erase(session, post)
     session.refresh(post)
 
     assert post.deleted_at.tzinfo is not None
@@ -81,14 +81,13 @@ def test_migrated_table_has_the_models_columns(session: Session) -> None:
 def test_updated_at_only_changes_when_the_application_sets_it(
     session: Session, alice: User
 ) -> None:
-    # Marking a post as deleted is not an edit and must not look like one.
+    # Erasing a post is not an edit and must not look like one.
     written = datetime.now(timezone.utc) - timedelta(days=3)
     post = Post(author=alice, content="Old", created_at=written, updated_at=written)
     session.add(post)
     session.flush()
 
-    post.deleted_at = datetime.now(timezone.utc)
-    session.flush()
+    erase(session, post)
     session.refresh(post)
 
     assert post.updated_at == written
@@ -168,21 +167,25 @@ def test_reply_is_held_to_the_same_content_rules(
 # --- deletion ------------------------------------------------------------
 
 
-def test_marking_a_post_as_deleted_keeps_the_row_and_what_refers_to_it(
+def test_erased_post_keeps_its_row_for_its_replies_and_nothing_of_itself(
     session: Session, bob: User, post: Post
 ) -> None:
     reply = reply_to(session, post, bob)
-    session.add_all([Like(user=bob, post=post), Repost(user=bob, post=post)])
-    session.flush()
+    post_id = post.id
 
-    post.deleted_at = datetime.now(timezone.utc)
-    session.flush()
+    erase(session, post)
     session.expire_all()
 
-    assert session.get(Post, post.id).content == "Hello, Hopsnop!"
-    assert session.get(Post, reply.id).parent_post_id == post.id
-    assert session.scalar(select(func.count()).select_from(Like)) == 1
-    assert session.scalar(select(func.count()).select_from(Repost)) == 1
+    tombstone = session.get(Post, post_id)
+    assert (tombstone.author_id, tombstone.author, tombstone.content) == (
+        None,
+        None,
+        None,
+    )
+    assert tombstone.deleted_at is not None
+    # What the reply needs is there: the row it points at.
+    assert session.get(Post, reply.id).parent_post_id == post_id
+    assert tombstone.replies == [reply]
 
 
 def test_post_with_replies_cannot_be_removed_from_the_database(

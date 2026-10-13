@@ -50,7 +50,7 @@ def failures_counted(session: Session, user: User) -> int | None:
     return session.scalar(
         select(RateLimit.count).where(
             RateLimit.key_hash
-            == rate_limit.key_hash("change-password:account", str(user.id))
+            == rate_limit.key_hash("password-confirmation:account", str(user.id))
         )
     )
 
@@ -501,7 +501,7 @@ def test_guessing_the_current_password_is_limited(
     alice_client: TestClient, session: Session, alice_account: User
 ) -> None:
     before = stored_hash(session, alice_account)
-    allowed = settings.password_change_failures
+    allowed = settings.password_confirmation_failures
 
     guesses = [
         change(alice_client, current_password=f"guess number {number}")
@@ -522,7 +522,7 @@ def test_guessing_the_current_password_is_limited(
 def test_limit_follows_the_account_to_every_session(
     alice_client: TestClient, make_client
 ) -> None:
-    for number in range(settings.password_change_failures):
+    for number in range(settings.password_confirmation_failures):
         change(alice_client, current_password=f"guess number {number}")
     other = make_client(client=("198.51.100.23", 50000))
     log_in(other)
@@ -534,7 +534,7 @@ def test_limit_follows_the_account_to_every_session(
 def test_limit_is_each_accounts_own(
     alice_client: TestClient, bob_client: TestClient
 ) -> None:
-    for number in range(settings.password_change_failures + 1):
+    for number in range(settings.password_confirmation_failures + 1):
         change(alice_client, current_password=f"guess number {number}")
 
     assert change(bob_client).status_code == 200
@@ -545,7 +545,7 @@ def test_successful_changes_are_not_counted(
 ) -> None:
     passwords = [PASSWORD] + [
         f"passphrase number {number}"
-        for number in range(settings.password_change_failures + 2)
+        for number in range(settings.password_confirmation_failures + 2)
     ]
 
     for current, new in zip(passwords, passwords[1:]):
@@ -557,7 +557,7 @@ def test_successful_changes_are_not_counted(
 def test_change_is_possible_again_when_the_window_is_over(
     alice_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    for number in range(settings.password_change_failures):
+    for number in range(settings.password_confirmation_failures):
         change(alice_client, current_password=f"guess number {number}")
     assert change(alice_client).status_code == 429
 

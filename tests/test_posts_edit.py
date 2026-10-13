@@ -10,7 +10,13 @@ from sqlalchemy.orm import Session
 from app.models import User
 from app.schemas.post import UpdatePostRequest
 from app.services import posts as posts_service
-from helpers import add_post, post_columns, recorded_selects
+from helpers import (
+    add_post,
+    post_columns,
+    recorded_selects,
+    stored_post,
+    where_text_is_stored,
+)
 
 NOT_AUTHENTICATED = {"detail": "Not authenticated."}
 NOT_FOUND = {"detail": "Post not found."}
@@ -466,8 +472,10 @@ def test_post_cannot_be_deleted_or_restored_through_an_edit(
     alice_client.delete(f"/posts/{post['id']}")
     response = edit(alice_client, post["id"], "Back again", deleted_at=None)
 
+    # Nothing is left to restore, and nothing was written in its place.
     assert response.status_code == 404
-    assert post_columns(session, uuid.UUID(post["id"]))["deleted_at"] is not None
+    assert stored_post(session, uuid.UUID(post["id"])) is None
+    assert where_text_is_stored(session, "Back again") == []
 
 
 # --- who may edit --------------------------------------------------------
@@ -559,13 +567,13 @@ def test_deleted_post_cannot_be_edited(
 ) -> None:
     post = create(alice_client, "Original")
     alice_client.delete(f"/posts/{post['id']}")
-    before = post_columns(session, uuid.UUID(post["id"]))
 
     response = edit(alice_client, post["id"], "Back again")
 
     assert response.status_code == 404
     assert response.json() == NOT_FOUND
-    assert post_columns(session, uuid.UUID(post["id"])) == before
+    assert stored_post(session, uuid.UUID(post["id"])) is None
+    assert where_text_is_stored(session, "Back again") == []
 
 
 def test_nonexistent_post_cannot_be_edited(alice_client: TestClient) -> None:

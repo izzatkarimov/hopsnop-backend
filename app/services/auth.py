@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import Select, delete, exists, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager
+from sqlalchemy.orm.exc import ObjectDeletedError
 
 from app.core.config import settings
 from app.core.security import (
@@ -27,6 +28,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models import EmailVerificationToken, PasswordResetToken, User, UserSession
+from app.services import erasure
 
 
 class AuthError(Exception):
@@ -68,6 +70,17 @@ class WrongCurrentPasswordError(AuthError):
     # Not a 401: the session is fine, and a client must not take this for
     # having been logged out.
     detail = "Current password is incorrect."
+
+
+class AccountNoLongerExistsError(AuthError):
+    """The account of the session that is asking was removed meanwhile.
+
+    The answer of a request without a session, which is what such a request
+    has become.
+    """
+
+    status_code = 401
+    detail = "Not authenticated."
 
 
 def _now() -> datetime:
@@ -408,10 +421,8 @@ def change_password(
     A reset link that is still outstanding is withdrawn as well. It was
     asked for under the old password and should not outlive it.
     """
-    user = current.user
-    verified_hash = user.password_hash
-    if not verify_password(current_password, verified_hash):
-        raise WrongCurrentPasswordError
+    user = account_of(current)
+    verified_hash = _check_current_password(user, current_password)
     # A new hash with a new salt, under the current Argon2 parameters. Made
     # before the account is locked, so the lock is not held for as long as
     # hashing takes.
@@ -419,13 +430,7 @@ def change_password(
 
     # From here on the account is locked: no login can open a session, and
     # no other change or reset can take place, until this one is committed.
-    # As in ``log_in``, the hash is read again under the lock. If it is not
-    # the one the current password was checked against, the password was
-    # changed or reset in the meantime, and the one that was proven here is
-    # not the current password any more.
-    account = _lock_account(db, user.id)
-    if account is None or account.password_hash != verified_hash:
-        raise WrongCurrentPasswordError
+    _lock_account_if_unchanged(db, user, verified_hash)
 
     now = _now()
     user.password_hash = new_hash
@@ -447,6 +452,31 @@ def change_password(
     )
     db.commit()
     return raw_token
+
+
+# --- account deletion ----------------------------------------------------
+
+
+def delete_account(db: Session, current: UserSession, *, password: str) -> None:
+    """Remove the account of the session's user, who must know the password.
+
+    At once and for good: there is no period in which it could be taken
+    back, and nothing is kept from which it could be restored. What is
+    removed, and in which order, is in ``app.services.erasure``.
+
+    The account's row is locked exclusively from the moment the password is
+    confirmed until the removal is committed. A login that was checking the
+    same password waits for that and then finds no account, so no session is
+    created that would outlive it; one that had got as far as creating a
+    session is waited for here, and its session is removed with the others.
+    A password change or reset that came first leaves an account whose
+    password is not the one that was proven, and the removal is refused.
+    """
+    user = account_of(current)
+    verified_hash = _check_current_password(user, password)
+    _lock_account_if_unchanged(db, user, verified_hash, exclusive=True)
+    erasure.erase_account(db, user.id, _now())
+    db.commit()
 
 
 # --- single-use tokens ---------------------------------------------------
@@ -481,7 +511,92 @@ def _issue_token(
     return raw_token
 
 
-def _lock_account(db: Session, user_id: uuid.UUID) -> User | None:
+# --- confirming the password ----------------------------------------------
+#
+# What an operation does that a session alone must not be enough for: the
+# user proves again that they know the password. It is two steps, and they
+# are the same two for every such operation.
+
+
+def account_of(session: UserSession) -> User:
+    """The account a session belongs to, if both are still there.
+
+    A request is authenticated at its start. By the time it comes to act,
+    its account may have been removed by another request, and the session
+    with it; the objects the request holds are then of rows that are gone.
+
+    Reading them again shows it in one of two ways. Either the session's
+    row is not found any more. Or it was still found, and the account's,
+    read a moment later, is not: the session then has no account, where
+    every session has one. Both mean the same, and neither is passed on as
+    an account.
+    """
+    try:
+        user = session.user
+    except ObjectDeletedError:
+        raise AccountNoLongerExistsError from None
+    if user is None:
+        raise AccountNoLongerExistsError
+    return user
+
+
+def confirm_password(db: Session, current: UserSession, *, password: str) -> User:
+    """The session's account, once its user has shown again that they know
+    the password. Its row is locked until the transaction ends.
+
+    For an operation that changes nothing about the account but must not be
+    done for a session alone, and during which the account has to stand
+    still: it cannot be removed, and its password cannot be replaced, until
+    the caller commits. The lock is the one a password change takes.
+
+    A wrong password is refused, and so is one that was right when it was
+    checked and has been changed or reset since.
+    """
+    user = account_of(current)
+    verified_hash = _check_current_password(user, password)
+    return _lock_account_if_unchanged(db, user, verified_hash)
+
+
+def _check_current_password(user: User, password: str) -> str:
+    """Check ``password`` against the account. Returns the hash it matched.
+
+    Checking takes a while and is done without holding any lock. The hash is
+    returned so that the caller can find out, once it does hold the lock,
+    whether that is still the account's password
+    (``_lock_account_if_unchanged``).
+    """
+    verified_hash = user.password_hash
+    if not verify_password(password, verified_hash):
+        raise WrongCurrentPasswordError
+    return verified_hash
+
+
+def _lock_account_if_unchanged(
+    db: Session,
+    user: User,
+    verified_hash: str,
+    *,
+    exclusive: bool = False,
+) -> User:
+    """Lock the account, and make sure its password is still the one proven.
+
+    As in ``log_in``, the hash is read again under the lock. If it is not
+    the one the password was checked against, the password was changed or
+    reset in the meantime, and what was proven is not the current password
+    any more. If the account is not there at all, it was removed in the
+    meantime, and its sessions with it.
+    """
+    account = _lock_account(db, user.id, exclusive=exclusive)
+    if account is None:
+        raise AccountNoLongerExistsError
+    if account.password_hash != verified_hash:
+        raise WrongCurrentPasswordError
+    return account
+
+
+def _lock_account(
+    db: Session, user_id: uuid.UUID, *, exclusive: bool = False
+) -> User | None:
     """The account as it is now, its row locked until the transaction ends.
 
     The row is what a login, a password change, a password reset and the
@@ -498,13 +613,50 @@ def _lock_account(db: Session, user_id: uuid.UUID) -> User | None:
     The lock is FOR NO KEY UPDATE, the same that ``_for_issuing_a_token``
     takes. It does not hold up anything that only refers to the account,
     such as a post being written by it.
+
+    ``exclusive`` asks for FOR UPDATE instead, which does hold those up as
+    well: nothing can be added that refers to the account, and what is being
+    added is waited for. That is for removing the account, and for nothing
+    else. The two locks exclude each other, so the order above holds for
+    both.
     """
     return db.scalar(
         select(User)
         .where(User.id == user_id)
-        .with_for_update(key_share=True)
+        .with_for_update(key_share=not exclusive)
         .execution_options(populate_existing=True)
     )
+
+
+def hold_account(db: Session, user: User) -> None:
+    """Keep the account of the user who is asking in place while they write.
+
+    For a request that writes a row in the user's name: a post, a like, a
+    follow, a story, a view of one. Such a row refers to the account, and
+    the database locks the account's row for it when the row is written
+    (FOR KEY SHARE: the account cannot be removed until the row is
+    committed). This takes that lock at the start instead, before the
+    request holds anything else.
+
+    When it is taken matters once accounts can be removed. A removal holds
+    the account's row and then goes on to the account's posts and stories.
+    A request that held one of those first, a post it was replying to, say,
+    and only then came to need the account's row, would wait for the
+    removal while the removal waited for it. With the account's row taken
+    first, here as there, one of the two waits for the other and that is
+    all: this request, to find that its account is gone; or the removal,
+    until the row is written, which it then removes with everything else.
+
+    The lock holds up nothing but a removal. Logins, password changes and
+    any number of other writes by the same user go on beside it.
+    """
+    held = db.scalar(
+        select(User.id)
+        .where(User.id == user.id)
+        .with_for_update(read=True, key_share=True)
+    )
+    if held is None:
+        raise AccountNoLongerExistsError
 
 
 def _for_issuing_a_token(email: str) -> Select[tuple[User]]:

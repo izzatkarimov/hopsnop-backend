@@ -217,6 +217,8 @@ def test_the_only_user_routes_are_the_intended_ones() -> None:
     assert routes == {
         ("GET", "/users/me"),
         ("PATCH", "/users/me"),
+        # Reads everything of the caller's own, and asks for the password.
+        ("POST", "/users/me/export"),
         ("GET", "/users/{username}"),
         # Read-only, and the only route that reaches a user's posts.
         ("GET", "/users/{username}/posts"),

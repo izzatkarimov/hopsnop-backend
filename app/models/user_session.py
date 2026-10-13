@@ -42,7 +42,8 @@ class UserSession(Base):
     expires_at: Mapped[datetime] = mapped_column()
     last_used_at: Mapped[datetime] = mapped_column()
     # NULL while the session is usable. Logging out sets this rather than
-    # deleting the row, so that the session's history is kept.
+    # deleting the row. The row stays, among the account's past sessions,
+    # until the retention purge removes it (``app.services.retention``).
     revoked_at: Mapped[datetime | None] = mapped_column()
 
     user: Mapped[User] = relationship(back_populates="sessions")

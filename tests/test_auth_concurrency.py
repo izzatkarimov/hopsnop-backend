@@ -14,180 +14,22 @@ point (``Gate``), the other one is started, and the first is let go once the
 other has finished or is seen to be waiting for it.
 """
 
-import threading
-import time
-import uuid
-from collections.abc import Callable, Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, func, select, text, update
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select, update
 
 from app.core.config import settings
 from app.core.security import hash_token
 from app.db.session import SessionLocal
-from app.main import app
-from app.models import (
-    EmailVerificationToken,
-    PasswordResetToken,
-    RateLimit,
-    User,
-    UserSession,
-)
+from app.models import EmailVerificationToken, PasswordResetToken, User
 from app.services import auth as auth_service
-from app.services.rate_limit import key_hash
-from helpers import PASSWORD, PASSWORD_HASH, log_in
+from concurrency import TIMEOUT, Gate, let_run
+from helpers import PASSWORD, log_in
 
 NEW_PASSWORD = "an entirely different passphrase"
-# Long enough for anything here to happen, and never waited out when things
-# work: every wait ends as soon as what it waits for has happened.
-TIMEOUT = 15
-ADDRESS_SCOPES = (
-    "login:address",
-    "forgot-password",
-    "resend-verification",
-    "verify-email",
-    "reset-password",
-)
-
-
-class Account:
-    """An account that really exists, with the addresses used against it."""
-
-    def __init__(self, *, verified: bool = True) -> None:
-        self.name = f"race_{uuid.uuid4().hex[:12]}"
-        self.email = f"{self.name}@example.com"
-        self.run = uuid.uuid4().hex
-        self.addresses: set[str] = set()
-        with SessionLocal() as db:
-            user = User(
-                username=self.name,
-                email=self.email,
-                password_hash=PASSWORD_HASH,
-                display_name="Race",
-                email_verified_at=datetime.now(timezone.utc) if verified else None,
-            )
-            db.add(user)
-            db.commit()
-            self.id = user.id
-
-    def client(self, number: int) -> TestClient:
-        address = f"race-{self.run}-{number}"
-        self.addresses.add(address)
-        return TestClient(app, base_url="https://testserver", client=(address, 50000))
-
-    def sessions(self, db: Session) -> list[UserSession]:
-        return list(
-            db.scalars(select(UserSession).where(UserSession.user_id == self.id))
-        )
-
-    def unused_tokens(self, model: type) -> list[str]:
-        with SessionLocal() as db:
-            return list(
-                db.scalars(
-                    select(model.token_hash).where(
-                        model.user_id == self.id, model.used_at.is_(None)
-                    )
-                )
-            )
-
-    def remove(self) -> None:
-        keys = [key_hash("change-password:account", str(self.id))]
-        for identifier in (self.name, self.email):
-            keys.append(key_hash("login:identifier", identifier))
-            keys += [
-                key_hash("login:identifier+address", f"{identifier}\x00{address}")
-                for address in self.addresses
-            ]
-        for address in self.addresses:
-            keys += [key_hash(scope, address) for scope in ADDRESS_SCOPES]
-        with SessionLocal() as db:
-            db.execute(delete(RateLimit).where(RateLimit.key_hash.in_(keys)))
-            # Its sessions and tokens go with it.
-            db.execute(delete(User).where(User.id == self.id))
-            db.commit()
-
-
-@pytest.fixture
-def account() -> Iterator[Callable[..., Account]]:
-    made: list[Account] = []
-
-    def make(**kwargs: bool) -> Account:
-        made.append(Account(**kwargs))
-        return made[-1]
-
-    yield make
-    for one in made:
-        one.remove()
-
-
-class Gate:
-    """Stops one call of a function, right after it has returned.
-
-    Once ``close`` has been called, the next call of the wrapped function
-    does its work and then waits at the gate until ``open`` is called. Every
-    other call passes straight through.
-    """
-
-    def __init__(self) -> None:
-        self._closed = False
-        self._lock = threading.Lock()
-        self.reached = threading.Event()
-        self._opened = threading.Event()
-
-    def wrap(self, function: Callable) -> Callable:
-        def wrapped(*args: object, **kwargs: object) -> object:
-            result = function(*args, **kwargs)
-            with self._lock:
-                stop_here, self._closed = self._closed, False
-            if stop_here:
-                self.reached.set()
-                assert self._opened.wait(TIMEOUT), "the gate was never opened"
-            return result
-
-        return wrapped
-
-    def close(self) -> None:
-        self._closed = True
-
-    def open(self) -> None:
-        self._opened.set()
-
-
-@pytest.fixture
-def issued(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Every raw token the application generates, in the order it does."""
-    tokens: list[str] = []
-    generate = auth_service.generate_token
-
-    def recording_generate() -> str:
-        tokens.append(generate())
-        return tokens[-1]
-
-    monkeypatch.setattr(auth_service, "generate_token", recording_generate)
-    return tokens
-
-
-def requests_waiting_for_a_lock() -> int:
-    """How many statements the database is holding back for a row lock."""
-    with SessionLocal() as db:
-        return db.scalar(
-            text(
-                "SELECT count(*) FROM pg_stat_activity "
-                "WHERE datname = current_database() AND wait_event_type = 'Lock'"
-            )
-        )
-
-
-def let_run(other: Future) -> None:
-    """Wait until ``other`` has finished, or is waiting for a lock to be released."""
-    deadline = time.monotonic() + TIMEOUT
-    while not other.done() and requests_waiting_for_a_lock() == 0:
-        assert time.monotonic() < deadline, "neither finished nor waiting"
-        time.sleep(0.01)
 
 
 # --- a login with the old password, and the password being replaced ------

@@ -8,7 +8,6 @@ contain.
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -271,10 +270,11 @@ def test_hidden_post_takes_the_same_statements_as_one_that_does_not_exist(
         recorded.append([s for s in statements if "SAVEPOINT" not in s])
 
     # The same work in each case, and none of it a write: the lookup of the
-    # session and the lookup of the post, which finds nothing.
+    # session, the user's own account held in place, and the lookup of the
+    # post, which finds nothing.
     assert recorded[0] == recorded[1] == recorded[2]
     selects = [s for s in recorded[0] if s.startswith("SELECT")]
-    assert len(selects) == 2
+    assert len(selects) == 3
     assert not any(s.startswith(("INSERT", "DELETE", "UPDATE")) for s in recorded[0])
 
 
@@ -746,14 +746,19 @@ def test_interaction_and_post_deletion_do_not_resurrect_anything(
     post = alice_client.post("/posts", json={"content": "Short-lived"}).json()
     assert change(bob_client, "POST", kind, post["id"]).status_code == 200
     assert alice_client.delete(f"/posts/{post['id']}").status_code == 204
-    deleted_at = session.scalar(select(Post.deleted_at))
 
+    def stored() -> tuple[int, int, int]:
+        return tuple(
+            session.scalar(select(func.count()).select_from(model))
+            for model in (Post, Like, Repost)
+        )
+
+    assert stored() == (0, 0, 0)
     for method in ("POST", "DELETE"):
         assert change(bob_client, method, kind, post["id"]).status_code == 404
 
-    assert isinstance(deleted_at, datetime)
-    assert deleted_at <= datetime.now(timezone.utc)
-    assert session.scalar(select(Post.deleted_at)) == deleted_at
+    # Neither the post nor a like or repost of it was written again.
+    assert stored() == (0, 0, 0)
     assert bob_client.get(f"/posts/{post['id']}").status_code == 404
 
 
@@ -769,5 +774,25 @@ def test_hidden_lookup_is_one_statement_like_reading_the_post(
     with recorded_selects() as changing:
         assert change(bob_client, method, kind, post_id).status_code == 404
 
-    # The very statement that reading the post runs, and nothing after it.
-    assert changing == reading
+    # One statement to find the session and one to look for the post, as
+    # when reading it, and nothing after that. Between the two, a change
+    # holds the user's own account in place, which is no look at the post.
+    assert (len(reading), len(changing)) == (2, 3)
+    assert changing[0] == reading[0]
+    assert "FROM posts" not in changing[1]
+    looking, read = (
+        " ".join(statement.split()) for statement in (changing[2], reading[1])
+    )
+    # The same rules decide whether the post is there...
+    for condition in (
+        "posts.deleted_at IS NULL",
+        "users.is_active IS true",
+        "users.email_verified_at IS NOT NULL",
+    ):
+        assert condition in looking and condition in read, condition
+    # ...and the post is held in place while the change is made, which
+    # reading has no need of.
+    assert looking.endswith("FOR KEY SHARE OF posts")
+    assert "FOR " not in read
+    # Nothing of the post is read for it but that it is there.
+    assert "posts.content" not in looking

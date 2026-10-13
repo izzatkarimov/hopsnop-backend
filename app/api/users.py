@@ -8,11 +8,16 @@ are in ``app.services.posts`` with those of the other post endpoints.
 
 Following a user, and the lists of who follows whom, are here too; their
 rules are in ``app.services.users``.
+
+So is the export of the signed-in user's data, which is made by
+``app.services.export``.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 
+from app.api.auth import data_export_limit, password_confirmation_limits
 from app.api.deps import (
+    CurrentSession,
     CurrentUser,
     DbSession,
     OptionalUser,
@@ -20,6 +25,7 @@ from app.api.deps import (
     VerifiedUser,
     no_store,
 )
+from app.schemas.export import AccountExport, ExportRequest
 from app.schemas.post import PostPageResponse, PostResponse
 from app.schemas.user import (
     FollowResponse,
@@ -30,7 +36,10 @@ from app.schemas.user import (
     UserSummaryResponse,
     canonical_username,
 )
+from app.services import auth as auth_service
+from app.services import export as export_service
 from app.services import posts as posts_service
+from app.services import rate_limit
 from app.services import users as users_service
 from app.services.users import OwnProfile
 
@@ -81,6 +90,63 @@ def update_my_profile(
     """
     profile = users_service.update_profile(db, user, data.changes())
     return _my_profile_response(profile)
+
+
+@router.post(
+    "/me/export",
+    response_model=AccountExport,
+    dependencies=[Depends(no_store)],
+)
+def export_my_data(
+    data: ExportRequest,
+    current: CurrentSession,
+    response: Response,
+    db: DbSession,
+) -> AccountExport:
+    """Everything Hopsnop holds that is the signed-in user's own, as one
+    JSON document to download.
+
+    The password has to be given again: a session alone does not hand out
+    all of an account's data. Whose data it is, is always the signed-in
+    user's; there is no way to name another.
+
+    The document holds no password, no token and no id of a session, and of
+    other people only what the user could already see: the usernames of
+    accounts they follow or are followed by, and the ids of posts and
+    stories they answered, liked, reposted or viewed.
+
+    It is not a snapshot of one moment. Its parts are read one after the
+    other, and each shows the user's data as it was when that part was
+    read. What the user does while the export is being made can be in one
+    part and not in another.
+    """
+    # Two counters, and a place is taken in both or in neither: the wrong
+    # passwords of the account, whatever asked for the password, and its
+    # exports. Which place is kept depends on how the request turns out.
+    limits = [*password_confirmation_limits(current), data_export_limit(current)]
+    *confirmed, exported = rate_limit.count_all(db, limits)
+    try:
+        export = export_service.export_account(
+            db, current, password=data.password.get_secret_value()
+        )
+    except auth_service.AccountNoLongerExistsError:
+        # The account was removed while this was under way, and its counters
+        # with it. What was counted here since is not left behind for an
+        # account that is not there.
+        rate_limit.forget(db, limits)
+        raise
+    except auth_service.AuthError:
+        # No export came of it, so none is counted. What it was refused
+        # for stays counted as that.
+        rate_limit.uncount_all(db, [exported])
+        raise
+    # The password was right, so this was not a guess.
+    rate_limit.uncount_all(db, confirmed)
+    day = export.generated_at.strftime("%Y-%m-%d")
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="hopsnop-export-{export.account.username}-{day}.json"'
+    )
+    return export
 
 
 # Declared after /users/me, which therefore always takes precedence. No
